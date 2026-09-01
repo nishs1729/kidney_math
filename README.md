@@ -1,2 +1,24 @@
-# kidney_math
-Mathematical Modeling of Renal Physiology 
+Mathematical Modeling of Renal Physiology
+=========================================
+> kidney_math
+
+### Directory structure
+
+```text
+kidney_math/
+├── notes/
+│   ├── chapter_01.md
+│   ├── chapter_02.md
+│   ├── chapter_03.md
+│   ├── chapter_04.md
+│   ├── chapter_05.md
+│   ├── chapter_06.md
+│   ├── chapter_07.md
+│   └── chapter_08.md
+├── src/
+│   ├── models/
+│   │   └── components/
+│   ├── output/
+│   └── analysis/
+└── book_errata.md
+```
