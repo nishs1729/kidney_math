@@ -2,3 +2,10 @@ data
 
 .obsidian
 .claude
+
+**/temp*
+**/tmp*
+**/junk*
+**/jnk*
+
+**/__pycache__

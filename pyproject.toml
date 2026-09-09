@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kidney-math"
+version = "0.1.0"
+description = "Mathematical Modeling of Renal Physiology and Literature Survey Tools"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+pubmed-query = "tool.pubmed_query:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tool*", "src*"]
