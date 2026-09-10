@@ -37,6 +37,7 @@ Quick usage
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -362,18 +363,40 @@ def _oa_search_raw(
     compact: bool = False,
     mailto: Optional[str] = None,
 ) -> Dict[str, Any]:
-    params: Dict[str, Any] = {
-        "search": query,
-        "per-page": min(max_results, 100),
-        "mailto": mailto or os.getenv("OPENALEX_EMAIL"),
-    }
+    # Strip PubMed/Europe-PMC-style field tags (`[MeSH Terms]`, `[Publication
+    # Type]`, ...) — OpenAlex doesn't recognize this syntax and, worse than
+    # just ignoring it, its query parser treats the bracket contents as extra
+    # literal AND'd words (confirmed via its own query diagnostic: a query
+    # ending in `"Renal Circulation"[MeSH Terms]` was parsed as
+    # `MeSH Terms and stemmed "Renal Circulation"`, matching any paper
+    # containing the words "MeSH" and "Terms" together). Queries built for the
+    # shared cross-source batch keep this syntax for PubMed/Europe PMC; here
+    # it's actively harmful rather than merely unmatched, so it's removed.
+    oa_query = re.sub(r"\[[^\]]*\]", "", query)
+
+    # Match against title+abstract only, not `search=`'s whole-fulltext match.
+    # The latter (OpenAlex's `fulltext.search` filter under the hood) treats a
+    # compound boolean query as a loose bag of words scanned across an entire
+    # paper's body text, which surfaces huge, generically-cited-but-irrelevant
+    # papers (a paper mentioning "kidney" once in a case example, "review"
+    # somewhere in its own text, etc.). title_and_abstract.search actually
+    # honors the AND/OR/quote structure and requires the terms to be about
+    # what the paper is about, not just present somewhere in it.
+    filters = [f"title_and_abstract.search:{oa_query}"]
     if year_range:
         # Accept '2018-2024' or a single year; OpenAlex wants a from/to filter.
         if "-" in year_range:
             start, end = year_range.split("-", 1)
-            params["filter"] = f"from_publication_date:{start}-01-01,to_publication_date:{end}-12-31"
+            filters.append(f"from_publication_date:{start}-01-01")
+            filters.append(f"to_publication_date:{end}-12-31")
         else:
-            params["filter"] = f"publication_year:{year_range}"
+            filters.append(f"publication_year:{year_range}")
+
+    params: Dict[str, Any] = {
+        "filter": ",".join(filters),
+        "per-page": min(max_results, 100),
+        "mailto": mailto or os.getenv("OPENALEX_EMAIL"),
+    }
     qs = urllib.parse.urlencode({k: v for k, v in params.items() if v})
     raw = _http_get(f"{_OA_BASE}?{qs}")
     data = json.loads(raw)
@@ -391,7 +414,10 @@ def _oa_batch_raw(
     results: List[Dict[str, Any]] = []
     for i in range(0, len(dois), 50):
         chunk = dois[i:i + 50]
-        filt = "doi:" + "|".join(urllib.parse.quote(d, safe="") for d in chunk)
+        # Build the filter with raw (unencoded) DOIs — urlencode() below does the one
+        # encoding pass. Pre-quoting here would double-encode ('/' -> %2F -> %252F) and
+        # OpenAlex would then look for a DOI containing a literal '%2F', matching nothing.
+        filt = "doi:" + "|".join(chunk)
         params = {"filter": filt, "per-page": len(chunk), "mailto": mailto or os.getenv("OPENALEX_EMAIL")}
         qs = urllib.parse.urlencode({k: v for k, v in params.items() if v})
         raw = _http_get(f"{_OA_BASE}?{qs}")

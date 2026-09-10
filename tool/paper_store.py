@@ -2,15 +2,24 @@
 paper_store.py — Persistent, human-readable paper store.
 
 Replaces the fresh timestamped JSON+MD pair produced each round with a single
-append-friendly JSONL file (default `brainstorm/papers.jsonl`), one paper per
-line. Not specific to any one topic — `question` is just a field on each
-record, so results for different scientific questions live in the same store
-without colliding.
+append-friendly JSONL file, one paper per line. Not specific to any one
+topic — `question` is just a field on each record, so results for different
+scientific questions live in the same store without colliding.
 
 Why JSONL over a single JSON blob or a database file: every line is a
 complete, independently readable/greppable JSON object, `git diff` on the
 file only ever shows the papers that actually changed, and appending a new
 paper never requires rewriting or re-parenting the rest of the file.
+
+brainstorm/ layout (see brainstorm/README.md):
+    brainstorm/
+      <question-slug>/
+        README.md      <- full question text (slug alone is lossy)
+        papers.md      <- human-readable export, this question only
+        taxonomy/
+          round_01.py
+      data/
+        papers.jsonl   <- the shared store itself; not meant to be read directly
 
 Each record is a normalised article dict (see search_utils.py's schema) plus:
   id                str   stable key: "doi:<lowercased doi>" or "title:<alpha-only title>"
@@ -19,19 +28,44 @@ Each record is a normalised article dict (see search_utils.py's schema) plus:
   query_tags        list[str]  every taxonomy tag this paper has matched, across all rounds
 
 Usage:
-    from tool.paper_store import load, upsert, export_markdown
+    from tool.paper_store import load, upsert, export_question
 
     store = load()
     new_ids = upsert(store, articles, question=QUESTION, round_num=1)
-    export_markdown(store, "brainstorm/papers.md")
+    export_question(store, QUESTION)   # writes <slug>/README.md + <slug>/papers.md
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_STORE_PATH = _REPO_ROOT / "brainstorm" / "papers.jsonl"
+BRAINSTORM_ROOT = _REPO_ROOT / "brainstorm"
+DEFAULT_STORE_PATH = BRAINSTORM_ROOT / "data" / "papers.jsonl"
+
+
+def slugify(text: str, max_len: int = 40) -> str:
+    """
+    Naive kebab-case identifier: lowercases, replaces non-alphanumerics with
+    '-', and truncates. This is a dumb fallback, not a summarizer — truncating
+    a full question sentence usually just keeps its generic opening words
+    ("what-mathematical-models-have-been-used...") rather than the actual
+    topic. Prefer passing an explicit, hand-picked slug (e.g.
+    "tgf-renal-autoregulation") wherever one is accepted; this is only used
+    when no explicit slug is given.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:max_len].rstrip("-")
+
+
+def question_dir(
+    question: str,
+    slug: Optional[str] = None,
+    brainstorm_root: Path = BRAINSTORM_ROOT,
+) -> Path:
+    """The brainstorm/<slug>/ folder for a given question. Pass an explicit `slug` if you have one."""
+    return brainstorm_root / (slug or slugify(question))
 
 
 def paper_id(article: Dict[str, Any]) -> str:
@@ -77,6 +111,7 @@ def upsert(
     articles: List[Dict[str, Any]],
     question: str,
     round_num: int,
+    slug: Optional[str] = None,
     path: Path = DEFAULT_STORE_PATH,
 ) -> List[str]:
     """
@@ -84,6 +119,11 @@ def upsert(
 
     - A paper not previously in the store is inserted with `first_seen_round`
       and `question` set, and its `query_tag` folded into a `query_tags` list.
+      The resolved `slug` (explicit if given, else naively derived — see
+      `slugify()`) is stored too, so a later `export_question()` call (e.g.
+      from enrich_abstracts.py, which doesn't necessarily know what slug a
+      question was first run with) lands in the same brainstorm/<slug>/
+      folder instead of silently creating a second one.
     - A paper already in the store keeps its accumulated fields (e.g. any
       enrichment done since); this call only unions in the new `query_tag`
       and fills fields that were previously empty (e.g. an abstract fetched
@@ -94,6 +134,7 @@ def upsert(
     store to figure that out.
     """
     new_ids: List[str] = []
+    resolved_slug = slug or slugify(question)
 
     for art in articles:
         pid = paper_id(art)
@@ -103,6 +144,7 @@ def upsert(
             rec = dict(art)
             rec["id"] = pid
             rec["question"] = question
+            rec["slug"] = resolved_slug
             rec["first_seen_round"] = round_num
             rec["query_tags"] = [tag] if tag else []
             rec.pop("query_tag", None)
@@ -155,3 +197,32 @@ def export_markdown(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def export_question(
+    store: Dict[str, Dict[str, Any]],
+    question: str,
+    slug: Optional[str] = None,
+    brainstorm_root: Path = BRAINSTORM_ROOT,
+) -> Path:
+    """
+    Write brainstorm/<slug>/README.md (the question text) and
+    brainstorm/<slug>/papers.md (this question's papers only).
+
+    This is the human-facing output of a round — everything else (the raw
+    store, the taxonomy specs that produced it) is supporting material.
+
+    Returns the question's folder path.
+    """
+    qdir = question_dir(question, slug, brainstorm_root)
+    qdir.mkdir(parents=True, exist_ok=True)
+
+    readme = qdir / "README.md"
+    readme.write_text(f"# {question}\n", encoding="utf-8")
+
+    export_markdown(
+        store,
+        qdir / "papers.md",
+        filter_fn=lambda r: r.get("question") == question,
+    )
+    return qdir

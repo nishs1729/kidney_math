@@ -6,27 +6,34 @@ Replaces the throwaway per-round scripts written directly against
 search_utils.py: this is a single reusable CLI entry point that takes a
 concepts file (Step 1 input) and a taxonomy spec (Step 2 input), runs the
 batch (Step 3), dedupes (Step 4), and writes into the shared paper store
-(tool/paper_store.py) instead of a new timestamped file — so a second run on
-the same question only reports genuinely new papers, and a run on a
-different question can't collide with it.
+(tool/paper_store.py) — so a second run on the same question only reports
+genuinely new papers, and a run on a different question can't collide with
+it.
 
 By default this prints only a summary (source/tag counts, dedup delta, new
-vs. already-seen); pass --verbose to also print titles, or --export-md to
-render the full store as Markdown.
+vs. already-seen); pass --verbose to also print titles. Every run refreshes
+the human-facing export for this question:
+
+    brainstorm/
+      <question-slug>/
+        README.md          <- the question text
+        papers.md          <- this question's papers (regenerated every run)
+        taxonomy/
+          round_01.py       <- the Step-2 spec, saved for provenance
+      data/
+        papers.jsonl        <- the shared store (all questions, not for direct reading)
 
 Usage:
     python tool/run_loop.py \\
         --question "What mathematical models have been used to study X?" \\
         --concepts-file concepts.txt \\
-        --taxonomy-file taxonomy_round1.py \\
         --round 1
 
-concepts.txt: one free-text concept per line (Step 1 — MeSH expansion is
-    printed to stderr as a table to inform how you write the taxonomy file;
-    it is not auto-applied).
+    (Looks for the taxonomy spec at brainstorm/<slug>/taxonomy/round_01.py by
+    default — write it there first, or pass --taxonomy-file to use another path.)
 
-taxonomy_round1.py: a plain Python module defining ROWS, COLUMNS, and
-    (optionally) EXTRA_AND as top-level literals — a .py spec file instead of
+Taxonomy spec (round_01.py): a plain Python module defining ROWS, COLUMNS,
+    and (optionally) EXTRA_AND as top-level literals — a .py file instead of
     JSON so query phrases can use plain double quotes without escaping:
 
     ROWS = [
@@ -36,11 +43,6 @@ taxonomy_round1.py: a plain Python module defining ROWS, COLUMNS, and
         "model": '("mathematical model" OR "computational model")',
     }
     EXTRA_AND = "kidney"
-
-    Kept as a saved, git-diffable file (not just an inline Python call) so
-    each round's exact query provenance survives past the script that
-    produced it — the same durability reasoning behind paper_store.py's JSONL
-    format.
 """
 
 import argparse
@@ -56,7 +58,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tool.search_utils import expand_concepts, run_batch
 from tool.query_utils import build_queries
-from tool.paper_store import DEFAULT_STORE_PATH, load, upsert, export_markdown
+from tool.paper_store import DEFAULT_STORE_PATH, question_dir, load, upsert, export_question
 
 
 def load_taxonomy(path: Path) -> Tuple[list, dict, Optional[str]]:
@@ -84,16 +86,32 @@ def _print_vocab_table(vocab: dict) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--question", required=True, help="The scientific question this round is for")
+    ap.add_argument("--slug", default=None,
+                    help="Short kebab-case folder name for this question (e.g. "
+                         "'tgf-renal-autoregulation'). Default: a naive truncation of "
+                         "--question, which is usually a worse name — prefer passing this.")
     ap.add_argument("--concepts-file", help="One free-text concept per line (Step 1)")
-    ap.add_argument("--taxonomy-file", required=True, help="Python taxonomy spec, e.g. taxonomy_round1.py (Step 2)")
+    ap.add_argument("--taxonomy-file", default=None,
+                    help="Python taxonomy spec (Step 2). Default: "
+                         "brainstorm/<question-slug>/taxonomy/round_NN.py")
     ap.add_argument("--round", type=int, required=True, help="Round number for provenance")
     ap.add_argument("--sources", nargs="+", default=["pubmed", "openalex", "biorxiv", "medrxiv"])
     ap.add_argument("--max-per-query", type=int, default=15)
     ap.add_argument("--year-range", default=None)
     ap.add_argument("--store-path", default=str(DEFAULT_STORE_PATH))
-    ap.add_argument("--export-md", default=None, help="Also render the full store to this Markdown path")
     ap.add_argument("--verbose", action="store_true", help="Print every new paper's title, not just counts")
     args = ap.parse_args()
+
+    qdir = question_dir(args.question, args.slug)
+    taxonomy_path = Path(args.taxonomy_file) if args.taxonomy_file else (
+        qdir / "taxonomy" / f"round_{args.round:02d}.py"
+    )
+    if not taxonomy_path.exists():
+        sys.exit(
+            f"[ERROR] Taxonomy spec not found: {taxonomy_path}\n"
+            "Write it first (ROWS/COLUMNS/EXTRA_AND — see this script's docstring), "
+            "or pass --taxonomy-file to use a different path."
+        )
 
     if args.concepts_file:
         concepts = [
@@ -103,9 +121,9 @@ def main() -> None:
         vocab = expand_concepts(concepts)
         _print_vocab_table(vocab)
 
-    rows, columns, extra_and = load_taxonomy(Path(args.taxonomy_file))
+    rows, columns, extra_and = load_taxonomy(taxonomy_path)
     query_tags = build_queries(rows=rows, columns=columns, extra_and=extra_and)
-    sys.stderr.write(f"[Step 2] Built {len(query_tags)} queries from {args.taxonomy_file} (linted clean).\n")
+    sys.stderr.write(f"[Step 2] Built {len(query_tags)} queries from {taxonomy_path} (linted clean).\n")
 
     articles = run_batch(
         queries=list(query_tags.keys()),
@@ -118,7 +136,8 @@ def main() -> None:
 
     store_path = Path(args.store_path)
     store = load(store_path)
-    new_ids = upsert(store, articles, question=args.question, round_num=args.round, path=store_path)
+    new_ids = upsert(store, articles, question=args.question, round_num=args.round,
+                     slug=args.slug, path=store_path)
 
     # --- Summary (default output; no full dumps) ---
     by_source = Counter(a["source"] for a in articles)
@@ -135,9 +154,8 @@ def main() -> None:
             rec = store[pid]
             print(f"  - {rec['title']} ({rec.get('source')}, {rec.get('year')})")
 
-    if args.export_md:
-        export_markdown(store, Path(args.export_md))
-        print(f"Markdown export -> {args.export_md}")
+    out_dir = export_question(store, args.question, args.slug)
+    print(f"Updated {out_dir}/README.md and {out_dir}/papers.md")
 
 
 if __name__ == "__main__":

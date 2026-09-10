@@ -5,12 +5,13 @@ enrich_abstracts.py — Fetch abstracts for paper-store records that don't have 
 Generalizes this session's one-off add_abstracts.py: `run_batch`/`run_loop.py`
 fetch `compact=True` (no abstracts) for the broad sweep, so most records in
 the store need a follow-up fetch. This walks the store, batches PubMed
-records by PMID (one `efetch` call per 100), and looks up bioRxiv/medRxiv
-records individually by DOI against Europe PMC, then writes only the
-records that changed.
+records by PMID (one `efetch` call per 100), batches OpenAlex records by DOI
+(one call per 50), and looks up bioRxiv/medRxiv records individually by DOI
+against Europe PMC, then re-exports each affected question's
+brainstorm/<slug>/papers.md so the enriched abstracts show up there too.
 
 Usage:
-    python tool/enrich_abstracts.py [--store-path brainstorm/papers.jsonl] [--question "..."]
+    python tool/enrich_abstracts.py [--store-path brainstorm/data/papers.jsonl] [--question "..."]
 """
 
 import argparse
@@ -24,8 +25,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import json
-from tool.search_utils import fetch_pubmed_by_pmids, _http_get, _EPMC_BASE
-from tool.paper_store import DEFAULT_STORE_PATH, load, save
+from tool.search_utils import fetch_pubmed_by_pmids, fetch_openalex_by_dois, _http_get, _EPMC_BASE
+from tool.paper_store import DEFAULT_STORE_PATH, load, save, export_question
 
 
 def main() -> None:
@@ -45,6 +46,7 @@ def main() -> None:
     sys.stderr.write(f"[INFO] {len(missing)}/{len(records)} records missing an abstract.\n")
 
     pubmed_missing = [r for r in missing if r["source"] == "pubmed" and r.get("ids", {}).get("pmid")]
+    openalex_missing = [r for r in missing if r["source"] == "openalex" and r.get("doi")]
     rxiv_missing = [r for r in missing if r["source"] in ("biorxiv", "medrxiv") and r.get("doi")]
 
     updated = 0
@@ -67,6 +69,20 @@ def main() -> None:
                 r["is_review"] = full["is_review"]
             updated += 1
 
+    dois = [r["doi"] for r in openalex_missing]
+    abstract_by_doi = {}
+    full = fetch_openalex_by_dois(dois, compact=False)
+    for f in full:
+        doi = (f.get("doi") or "").strip().lower()
+        if doi:
+            abstract_by_doi[doi] = f
+
+    for r in openalex_missing:
+        full = abstract_by_doi.get(r["doi"].strip().lower())
+        if full and full.get("abstract"):
+            r["abstract"] = full["abstract"]
+            updated += 1
+
     for r in rxiv_missing:
         doi = r["doi"]
         q = f'DOI:"{doi}" AND SRC:PPR'
@@ -83,7 +99,13 @@ def main() -> None:
         time.sleep(0.34)
 
     save(store, store_path)
+
+    questions = {(r.get("question"), r.get("slug")) for r in records}
+    for question, slug in questions:
+        export_question(store, question, slug)
+
     print(f"Updated {updated} records with abstracts. Store -> {store_path}")
+    print(f"Refreshed papers.md for {len(questions)} question(s).")
 
 
 if __name__ == "__main__":
