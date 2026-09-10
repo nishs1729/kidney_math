@@ -12,11 +12,14 @@ from .search_utils import (
     search_biorxiv,
     search_medrxiv,
     search_all,
+    run_batch,
     deduplicate,
     fetch_pubmed_by_pmids,
     fetch_s2_by_ids,
     extract_dois,
     extract_titles,
+    get_mesh_terms,
+    expand_concepts,
 )
 
 __all__ = [
@@ -25,9 +28,12 @@ __all__ = [
     "search_biorxiv",
     "search_medrxiv",
     "search_all",
+    "run_batch",
     "deduplicate",
     "fetch_pubmed_by_pmids",
     "fetch_s2_by_ids",
     "extract_dois",
     "extract_titles",
+    "get_mesh_terms",
+    "expand_concepts",
 ]

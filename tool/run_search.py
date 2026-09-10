@@ -47,7 +47,7 @@ def _load_dotenv(repo_root: str) -> None:
 
 _load_dotenv(_REPO_ROOT)
 
-from tool.search_utils import search_all, deduplicate
+from tool.search_utils import search_all, deduplicate, run_batch
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +188,18 @@ def main():
     )
     parser.add_argument(
         "query",
+        nargs="?",
+        default="",
         help="Search query (e.g. 'SGLT2 proximal tubule transport model')",
+    )
+    parser.add_argument(
+        "--queries-file",
+        default=None,
+        help=(
+            "Path to a plain-text file with one query per line. "
+            "Runs run_batch() across all queries and merges results. "
+            "When set, the positional 'query' argument is ignored."
+        ),
     )
     parser.add_argument(
         "--sources",
@@ -247,6 +258,9 @@ def main():
 
     args = parser.parse_args()
 
+    if not args.query and not args.queries_file:
+        parser.error("Either a positional query or --queries-file must be provided.")
+
     # Resolve output directory
     output_dir = Path(
         args.dir
@@ -256,27 +270,55 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-    sys.stderr.write(f"[INFO] Searching: {args.query!r}\n")
-    sys.stderr.write(f"[INFO] Sources:   {', '.join(args.sources)}\n")
-    sys.stderr.write(f"[INFO] Max/source: {args.max_results}\n\n")
 
-    articles = search_all(
-        query=args.query,
-        max_results=args.max_results,
-        sources=args.sources,
-        compact=args.compact,
-        year_range=args.year,
-        date_range=args.date_range,
-        pubmed_api_key=args.pubmed_api_key,
-        pubmed_email=args.pubmed_email,
-        s2_api_key=args.s2_api_key,
-    )
+    # --- Batch mode (--queries-file) ---
+    if args.queries_file:
+        queries_path = Path(args.queries_file)
+        if not queries_path.exists():
+            sys.stderr.write(f"[ERROR] queries file not found: {queries_path}\n")
+            sys.exit(1)
+        queries = [
+            line.strip() for line in queries_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        sys.stderr.write(f"[INFO] Batch mode: {len(queries)} queries from {queries_path}\n")
+        sys.stderr.write(f"[INFO] Sources: {', '.join(args.sources)}\n")
+        sys.stderr.write(f"[INFO] Max/query/source: {args.max_results}\n\n")
+        articles = run_batch(
+            queries=queries,
+            sources=args.sources,
+            max_per_query=args.max_results,
+            compact=args.compact,
+            year_range=args.year,
+            date_range=args.date_range,
+            pubmed_api_key=args.pubmed_api_key,
+            pubmed_email=args.pubmed_email,
+            s2_api_key=args.s2_api_key,
+        )
+        effective_query = f"batch:{queries_path.name}"
+    # --- Single query mode ---
+    else:
+        sys.stderr.write(f"[INFO] Searching: {args.query!r}\n")
+        sys.stderr.write(f"[INFO] Sources:   {', '.join(args.sources)}\n")
+        sys.stderr.write(f"[INFO] Max/source: {args.max_results}\n\n")
+        articles = search_all(
+            query=args.query,
+            max_results=args.max_results,
+            sources=args.sources,
+            compact=args.compact,
+            year_range=args.year,
+            date_range=args.date_range,
+            pubmed_api_key=args.pubmed_api_key,
+            pubmed_email=args.pubmed_email,
+            s2_api_key=args.s2_api_key,
+        )
+        effective_query = args.query
 
     sys.stderr.write(f"[INFO] {len(articles)} unique papers after deduplication.\n\n")
 
     # --- Markdown report ---
     md = _format_markdown(
-        query=args.query,
+        query=effective_query,
         articles=articles,
         sources=args.sources,
         compact=args.compact,

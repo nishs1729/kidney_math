@@ -340,12 +340,14 @@ def _s2_search_raw(
     year_range: Optional[str] = None,
     fields_of_study: Optional[List[str]] = None,
     compact: bool = False,
+    sort: str = "Relevance",
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     params: Dict[str, Any] = {
         "query": query,
         "limit": min(max_results, 100),
         "fields": _S2_FIELDS_COMPACT if compact else _S2_FIELDS,
+        "sort": sort,
     }
     if fields_of_study:
         params["fieldsOfStudy"] = ",".join(fields_of_study)
@@ -376,33 +378,77 @@ def _s2_batch_raw(
 
 # ============================================================================
 # bioRxiv / medRxiv
+#
+# api.biorxiv.org / api.medrxiv.org never offered a real keyword-search
+# endpoint for general use (only date-range "details" dumps); the old
+# /search/{server}/{terms}/... path this module used to call has since
+# started 404-ing outright. Europe PMC indexes both preprint servers (as
+# source "PPR") behind a proper full-text search API with no key required,
+# so that's what we query instead, filtered to the requesting server via
+# PUBLISHER:"bioRxiv" / PUBLISHER:"medRxiv".
 # ============================================================================
 
-_BIO_BASE = "https://api.biorxiv.org"
-_MED_BASE = "https://api.medrxiv.org"
+_EPMC_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 _DEFAULT_DATE_RANGE = "2019-01-01:2099-12-31"
 
 
-def _rxiv_base(server: str) -> str:
-    return _MED_BASE if server == "medrxiv" else _BIO_BASE
+_epmc_last_request: float = 0.0  # monotonic timestamp of last Europe PMC request
+
+
+def _rxiv_throttle(min_interval: float = 0.34) -> None:
+    """Sleep if needed to keep Europe PMC requests to a courteous rate."""
+    global _epmc_last_request
+    elapsed = time.monotonic() - _epmc_last_request
+    if elapsed < min_interval:
+        time.sleep(min_interval - elapsed)
+    _epmc_last_request = time.monotonic()
+
+
+def _epmc_date_filter(date_range: str) -> str:
+    """Convert 'YYYY-MM-DD:YYYY-MM-DD' into an EPMC FIRST_PDATE range clause."""
+    try:
+        start, end = date_range.split(":")
+    except ValueError:
+        return ""
+    return f' AND FIRST_PDATE:[{start} TO {end}]'
 
 
 def _rxiv_parse(raw: Dict[str, Any], server: str) -> Dict[str, Any]:
     doi = raw.get("doi", "")
-    authors_raw = raw.get("authors", "")
-    authors = [a.strip() for a in authors_raw.split(";") if a.strip()]
+    authors = [a.get("fullName", "") for a in
+               (raw.get("authorList") or {}).get("author", []) if a.get("fullName")]
+    if not authors:
+        authors = [a.strip() for a in (raw.get("authorString") or "").split(",") if a.strip()]
+    pub_date = raw.get("firstPublicationDate", "") or ""
+    year = raw.get("pubYear", "") or pub_date[:4]
+
+    published = ""
+    for cc in (raw.get("commentCorrectionList") or {}).get("commentCorrection", []):
+        if cc.get("type") == "Preprint of":
+            published = cc.get("reference", "")
+            break
+
+    pdf_url = ""
+    for link in (raw.get("fullTextUrlList") or {}).get("fullTextUrl", []):
+        if link.get("documentStyle") == "pdf":
+            pdf_url = link.get("url", "")
+            break
+
+    url = f"https://doi.org/{doi}" if doi else ""
+
     return {
         "doi": doi,
         "title": raw.get("title", ""),
         "authors": authors,
-        "date": raw.get("date", ""),
-        "year": (raw.get("date") or "")[:4],
+        "date": pub_date,
+        "year": year,
         "server": server,
-        "category": raw.get("category", ""),
-        "version": raw.get("version", ""),
-        "abstract": raw.get("abstract", ""),
-        "url": f"https://www.{server}.org/content/{doi}" if doi else "",
-        "published": raw.get("published", ""),
+        "category": "",
+        "version": "",
+        "abstract": raw.get("abstractText", ""),
+        "url": url,
+        "pdf_url": pdf_url,
+        "published": published,
     }
 
 
@@ -412,47 +458,43 @@ def _rxiv_search_raw(
     max_results: int = 10,
     date_range: str = _DEFAULT_DATE_RANGE,
 ) -> Dict[str, Any]:
-    base = _rxiv_base(server)
+    publisher = "medRxiv" if server == "medrxiv" else "bioRxiv"
+    epmc_query = f'{query} AND SRC:PPR AND PUBLISHER:"{publisher}"' + _epmc_date_filter(date_range)
+
     papers: List[Dict[str, Any]] = []
     total = 0
-    cursor = 0
-    encoded = urllib.parse.quote(query)
+    cursor_mark = "*"
+    page_size = min(max_results, 100)
+
     while len(papers) < max_results:
-        url = f"{base}/search/{server}/{encoded}/{date_range}/{cursor}/json"
+        params = {
+            "query": epmc_query,
+            "format": "json",
+            "resultType": "core",
+            "pageSize": page_size,
+            "cursorMark": cursor_mark,
+        }
+        qs = urllib.parse.urlencode(params)
         try:
-            raw = _http_get(url)
+            _rxiv_throttle()
+            raw = _http_get(f"{_EPMC_BASE}/search?{qs}")
         except Exception as exc:
-            sys.stderr.write(
-                f"[WARN] {server} search unavailable ({exc}); "
-                "falling back to date-browse + local filter.\n"
-            )
-            # Fallback: date-range browse filtered locally
-            browse_url = f"{base}/details/{server}/{date_range}/0/json"
-            try:
-                raw2 = _http_get(browse_url)
-                data2 = json.loads(raw2)
-                total = int((data2.get("messages", [{}])[0]).get("total", 0))
-                q_lower = query.lower()
-                for item in data2.get("collection") or []:
-                    if len(papers) >= max_results:
-                        break
-                    text = (item.get("title", "") + " " + item.get("abstract", "")).lower()
-                    if all(t in text for t in q_lower.split()):
-                        papers.append(_rxiv_parse(item, server))
-            except Exception as exc2:
-                sys.stderr.write(f"[WARN] {server} fallback also failed: {exc2}\n")
+            sys.stderr.write(f"[WARN] {server} (Europe PMC) search failed: {exc}\n")
             break
+
         data = json.loads(raw)
-        msgs = data.get("messages", [{}])
-        total = int((msgs[0] if msgs else {}).get("total", 0))
-        coll = data.get("collection") or []
-        for item in coll:
+        total = int(data.get("hitCount", 0))
+        results = (data.get("resultList") or {}).get("result", [])
+        for item in results:
             if len(papers) >= max_results:
                 break
             papers.append(_rxiv_parse(item, server))
-        if len(coll) < 100:
+
+        next_cursor = data.get("nextCursorMark", "")
+        if not results or not next_cursor or next_cursor == cursor_mark:
             break
-        cursor += 100
+        cursor_mark = next_cursor
+
     return {"total": total, "papers": papers}
 
 
@@ -516,7 +558,7 @@ def _norm_rxiv(a: Dict[str, Any]) -> Dict[str, Any]:
         "abstract": a.get("abstract", ""),
         "doi": a.get("doi", ""),
         "url": a.get("url", ""),
-        "pdf_url": "",
+        "pdf_url": a.get("pdf_url", ""),
         "ids": {
             "doi": a.get("doi", ""),
             "version": a.get("version", ""),
@@ -576,6 +618,7 @@ def search_semantic_scholar(
     year_range: Optional[str] = None,
     fields_of_study: Optional[List[str]] = None,
     compact: bool = False,
+    sort: str = "Relevance",
     api_key: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -587,12 +630,13 @@ def search_semantic_scholar(
         year_range: e.g. '2018-2024' or '2020'.
         fields_of_study: e.g. ['Medicine', 'Biology'].
         compact: Omit abstracts/fields-of-study.
+        sort: 'Relevance' (default), 'CitationCount', or 'PublicationDate'.
         api_key: S2 API key or set S2_API_KEY env var.
 
     Returns:
         List of normalised article dicts.
     """
-    res = _s2_search_raw(query, max_results, year_range, fields_of_study, compact, api_key)
+    res = _s2_search_raw(query, max_results, year_range, fields_of_study, compact, sort, api_key)
     arts = res["papers"]
     if compact:
         for a in arts:
@@ -734,8 +778,125 @@ def search_all(
 
 
 # ============================================================================
+# Batch multi-query search  (Step 2 of the search loop)
+# ============================================================================
+
+def run_batch(
+    queries: List[str],
+    sources: Optional[List[str]] = None,
+    max_per_query: int = 10,
+    compact: bool = True,
+    query_tags: Optional[Dict[str, str]] = None,
+    year_range: Optional[str] = None,
+    date_range: str = _DEFAULT_DATE_RANGE,
+    rxiv_delay: float = 1.1,
+    pubmed_api_key: Optional[str] = None,
+    pubmed_email: Optional[str] = None,
+    s2_api_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Run a batch of queries across multiple sources with a single dedup pass.
+
+    Designed for Step 2 of the search loop: the LLM generates 8-12 queries
+    per round; this function executes them all and returns a flat, deduplicated
+    list with provenance attached to each article.
+
+    Each returned article gains two extra fields:
+      query_text  str  the query string that retrieved this article
+      query_tag   str  optional taxonomy label (from query_tags), else ''
+
+    Args:
+        queries: List of search query strings.
+        sources: Which sources to query (default: all four).
+        max_per_query: Max articles per query per source.
+        compact: Omit abstracts (recommended for broad sweeps).
+        query_tags: Optional {query: tag} mapping for taxonomy labels.
+        year_range: Year filter for Semantic Scholar.
+        date_range: Date filter for bioRxiv/medRxiv.
+        rxiv_delay: Seconds between bioRxiv/medRxiv requests (default 1.1).
+        pubmed_api_key: NCBI API key (or NCBI_API_KEY env var).
+        pubmed_email: NCBI email (or NCBI_EMAIL env var).
+        s2_api_key: Semantic Scholar API key (or S2_API_KEY env var).
+
+    Returns:
+        Flat deduplicated list of normalised article dicts with provenance.
+    """
+    if sources is None:
+        sources = ["pubmed", "semantic_scholar", "biorxiv", "medrxiv"]
+    if query_tags is None:
+        query_tags = {}
+
+    all_articles: List[Dict[str, Any]] = []
+    rxiv_sources = {"biorxiv", "medrxiv"}
+
+    for q_idx, query in enumerate(queries):
+        tag = query_tags.get(query, "")
+        sys.stderr.write(f"[INFO] Batch {q_idx + 1}/{len(queries)}: {query!r}\n")
+        for src in sources:
+            try:
+                if src == "pubmed":
+                    arts = search_pubmed(query, max_per_query, compact=compact,
+                                         api_key=pubmed_api_key, email=pubmed_email)
+                elif src == "semantic_scholar":
+                    arts = search_semantic_scholar(query, max_per_query,
+                                                    year_range=year_range,
+                                                    compact=compact,
+                                                    api_key=s2_api_key)
+                elif src == "biorxiv":
+                    arts = search_biorxiv(query, max_per_query, date_range, compact)
+                elif src == "medrxiv":
+                    arts = search_medrxiv(query, max_per_query, date_range, compact)
+                else:
+                    sys.stderr.write(f"[WARN] Unknown source '{src}', skipping.\n")
+                    continue
+
+                for art in arts:
+                    art["query_text"] = query
+                    art["query_tag"] = tag
+                all_articles.extend(arts)
+
+                # Extra delay for preprint servers beyond the per-request throttle
+                if src in rxiv_sources:
+                    time.sleep(rxiv_delay)
+
+            except Exception as exc:
+                sys.stderr.write(f"[WARN] {src} failed for {query!r}: {exc}\n")
+
+    return deduplicate(all_articles)
+
+
+# ============================================================================
 # Deduplication & helpers
 # ============================================================================
+
+def _word_set(title: str) -> set:
+    """Lowercase word-set for Jaccard similarity (words longer than 2 chars)."""
+    return {w for w in title.lower().split() if len(w) > 2}
+
+
+def _jaccard(s1: set, s2: set) -> float:
+    """Jaccard similarity between two word-sets."""
+    if not s1 and not s2:
+        return 1.0
+    union = len(s1 | s2)
+    return len(s1 & s2) / union if union else 0.0
+
+
+def _author_key(authors: List[str]) -> str:
+    """
+    Extract the longest alpha token from the first author string (usually the surname).
+    Works across source formats: 'Layton AT', 'A. Layton', 'Anita T. Layton'.
+    """
+    if not authors:
+        return ""
+    tokens = sorted(
+        [t.lower() for t in authors[0].replace(".", " ").split()
+         if len(t) > 2 and t.isalpha()],
+        key=len,
+        reverse=True,
+    )
+    return tokens[0] if tokens else ""
+
 
 def deduplicate(
     articles: List[Dict[str, Any]],
@@ -744,9 +905,12 @@ def deduplicate(
     """
     Deduplicate normalised article dicts across sources.
 
-    Strategy (in priority order):
+    Matching strategy (first match wins, in priority order):
       1. Exact DOI match (lowercase-normalised).
-      2. Title match: alpha-only characters compared (handles punctuation variants).
+      2. Alpha-only title key (strips punctuation and case).
+      3. Word-Jaccard >= 0.85 on title word-sets.
+      4. Word-Jaccard >= 0.50 AND first-author surname match AND year match
+         — catches preprint-vs-published pairs with differing subtitles.
 
     When duplicates are found the copy from the higher-preference source is kept.
     Default preference: pubmed > semantic_scholar > biorxiv > medrxiv.
@@ -763,36 +927,68 @@ def deduplicate(
     rank = {s: i for i, s in enumerate(prefer_sources)}
 
     seen_doi: Dict[str, int] = {}
-    seen_title: Dict[str, int] = {}
+    seen_title_alpha: Dict[str, int] = {}
     unique: List[Dict[str, Any]] = []
+    word_sets: List[set] = []  # parallel to unique for O(n²) Jaccard scan
+
+    def _keep(existing_idx: int, candidate: Dict[str, Any]) -> None:
+        """Swap in candidate if it comes from a higher-preference source."""
+        existing = unique[existing_idx]
+        if rank.get(candidate.get("source", ""), 999) < rank.get(existing.get("source", ""), 999):
+            unique[existing_idx] = candidate
+            word_sets[existing_idx] = _word_set(candidate.get("title", ""))
+            dk = candidate.get("doi", "").strip().lower()
+            tk = "".join(c for c in candidate.get("title", "").lower() if c.isalpha())
+            if dk:
+                seen_doi[dk] = existing_idx
+            if tk:
+                seen_title_alpha[tk] = existing_idx
 
     for art in articles:
         doi_key = art.get("doi", "").strip().lower()
-        title_key = "".join(c for c in art.get("title", "").lower() if c.isalpha())
+        title_alpha = "".join(c for c in art.get("title", "").lower() if c.isalpha())
+        ws_new = _word_set(art.get("title", ""))
 
-        idx: Optional[int] = None
+        # --- Pass 1: exact DOI ---
+        if doi_key and doi_key in seen_doi:
+            _keep(seen_doi[doi_key], art)
+            continue
+
+        # --- Pass 2: alpha-only title ---
+        if title_alpha and title_alpha in seen_title_alpha:
+            _keep(seen_title_alpha[title_alpha], art)
+            continue
+
+        # --- Pass 3 & 4: Jaccard + author/year heuristic ---
+        matched_idx: Optional[int] = None
+        art_author = _author_key(art.get("authors", []))
+        art_year = art.get("year", "")
+
+        for idx, (existing, ws_ex) in enumerate(zip(unique, word_sets)):
+            jac = _jaccard(ws_new, ws_ex)
+            if jac >= 0.85:
+                matched_idx = idx
+                break
+            if (jac >= 0.50
+                    and art_year
+                    and art_year == existing.get("year", "")
+                    and art_author
+                    and art_author == _author_key(existing.get("authors", []))):
+                matched_idx = idx
+                break
+
+        if matched_idx is not None:
+            _keep(matched_idx, art)
+            continue
+
+        # --- New article ---
+        i = len(unique)
+        unique.append(art)
+        word_sets.append(ws_new)
         if doi_key:
-            idx = seen_doi.get(doi_key)
-        if idx is None and title_key:
-            idx = seen_title.get(title_key)
-
-        if idx is None:
-            i = len(unique)
-            unique.append(art)
-            if doi_key:
-                seen_doi[doi_key] = i
-            if title_key:
-                seen_title[title_key] = i
-        else:
-            # Keep the preferred-source version
-            old_rank = rank.get(unique[idx].get("source", ""), 999)
-            new_rank = rank.get(art.get("source", ""), 999)
-            if new_rank < old_rank:
-                unique[idx] = art
-                if doi_key:
-                    seen_doi[doi_key] = idx
-                if title_key:
-                    seen_title[title_key] = idx
+            seen_doi[doi_key] = i
+        if title_alpha:
+            seen_title_alpha[title_alpha] = i
 
     return unique
 
@@ -805,3 +1001,156 @@ def extract_dois(articles: List[Dict[str, Any]]) -> List[str]:
 def extract_titles(articles: List[Dict[str, Any]]) -> List[str]:
     """Return titles from a normalised article list."""
     return [a["title"] for a in articles if a.get("title")]
+
+
+# ============================================================================
+# MeSH term lookup
+# ============================================================================
+
+def get_mesh_terms(
+    query: str,
+    retmax: int = 10,
+    api_key: Optional[str] = None,
+    email: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Look up MeSH descriptors matching a free-text concept.
+
+    Uses NCBI E-utilities (esearch + esummary on the 'mesh' database).
+    No API key required; set NCBI_API_KEY env var or pass api_key for
+    higher rate limits.
+
+    Args:
+        query: Free-text concept to look up, e.g. 'tubuloglomerular feedback'.
+        retmax: Maximum number of MeSH descriptors to return (default 10).
+        api_key: NCBI API key (or set NCBI_API_KEY env var).
+        email: Contact email (or set NCBI_EMAIL env var).
+
+    Returns:
+        List of dicts with keys:
+          mesh_ui    str   MeSH unique identifier
+          name       str   preferred descriptor name
+          scope_note str   definition / scope note
+
+    Example:
+        >>> terms = get_mesh_terms('tubuloglomerular feedback')
+        >>> for t in terms:
+        ...     print(t['name'], '--', t['scope_note'])
+    """
+    key = api_key or os.getenv("NCBI_API_KEY")
+    mail = email or os.getenv("NCBI_EMAIL")
+
+    common: Dict[str, str] = {}
+    if key:
+        common["api_key"] = key
+    if mail:
+        common["email"] = mail
+
+    # 1. Find matching MeSH descriptor UIDs via esearch
+    search_params = {
+        "db": "mesh",
+        "term": query,
+        "retmode": "json",
+        "retmax": str(retmax),
+        "sort": "relevance",
+        **common,
+    }
+    qs = urllib.parse.urlencode(search_params)
+    raw = _http_get(f"{_NCBI_BASE}/esearch.fcgi?{qs}")
+    search_data = json.loads(raw)
+    ids = search_data.get("esearchresult", {}).get("idlist", [])
+    if not ids:
+        return []
+
+    # Rate-limit courtesy pause (3 req/s without API key)
+    time.sleep(0.34)
+
+    # 2. Pull descriptor details via esummary
+    summary_params = {
+        "db": "mesh",
+        "id": ",".join(ids),
+        "retmode": "json",
+        **common,
+    }
+    qs2 = urllib.parse.urlencode(summary_params)
+    raw2 = _http_get(f"{_NCBI_BASE}/esummary.fcgi?{qs2}")
+    summary_data = json.loads(raw2)
+    result_map = summary_data.get("result", {})
+
+    results = []
+    for uid in ids:
+        doc = result_map.get(uid, {})
+        entry_terms = doc.get("ds_meshterms") or []
+        results.append({
+            "mesh_ui": doc.get("uid", uid),
+            "name": entry_terms[0] if entry_terms else "",
+            "entry_terms": entry_terms,   # full list: synonyms, older names, abbreviations
+            "scope_note": doc.get("ds_scopenote", ""),
+        })
+    return results
+
+
+# ============================================================================
+# Concept expansion  (Step 1 of the search loop)
+# ============================================================================
+
+def expand_concepts(
+    concepts: List[str],
+    retmax: int = 5,
+    api_key: Optional[str] = None,
+    email: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Expand a list of free-text concepts into a MeSH-enriched vocabulary dict.
+
+    For each concept, looks up matching MeSH descriptors and returns the
+    official name, all entry-terms (synonyms, abbreviations, older terminology),
+    and the scope note. Used in Step 1 of the search loop: give the LLM your
+    raw concepts, get back the MeSH vocabulary to use when generating queries.
+
+    Args:
+        concepts: List of free-text concept strings from the LLM.
+        retmax: Max MeSH descriptors to retrieve per concept (default 5).
+        api_key: NCBI API key (or set NCBI_API_KEY env var).
+        email: Contact email (or set NCBI_EMAIL env var).
+
+    Returns:
+        Dict mapping each concept to its MeSH expansion::
+
+          {
+            "tubuloglomerular feedback": {
+              "status":      "found" | "not_found",
+              "mesh_name":   "Tubuloglomerular Feedback",
+              "mesh_ui":     "D016548",
+              "entry_terms": ["TGF", "tubuloglomerular balance", ...],
+              "scope_note":  "...",
+              "all_matches": [...]   # full list of MeSH hits (retmax)
+            },
+            ...
+          }
+    """
+    vocabulary: Dict[str, Any] = {}
+    for concept in concepts:
+        terms = get_mesh_terms(concept, retmax=retmax, api_key=api_key, email=email)
+        if terms:
+            best = terms[0]  # highest-ranked MeSH match
+            vocabulary[concept] = {
+                "status": "found",
+                "mesh_name": best["name"],
+                "mesh_ui": best["mesh_ui"],
+                "entry_terms": best["entry_terms"],
+                "scope_note": best["scope_note"],
+                "all_matches": terms,
+            }
+        else:
+            vocabulary[concept] = {
+                "status": "not_found",
+                "mesh_name": "",
+                "mesh_ui": "",
+                "entry_terms": [],
+                "scope_note": "",
+                "all_matches": [],
+            }
+        # Rate-limit courtesy between concept lookups (3 req/s without API key)
+        time.sleep(0.34)
+    return vocabulary
