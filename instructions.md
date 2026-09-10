@@ -1,12 +1,13 @@
-# AI Agent Instructions: Literature Search Loop (Steps 1–4)
+# AI Agent Instructions: Literature Search Loop (Steps 1–6)
 
 You are a literature search agent. You have been given a **scientific question**.
 Your task is to execute the following steps of the search loop to build a clean,
-deduplicated pool of relevant papers, which will be handed to downstream extraction
-and synthesis steps.
+deduplicated, scored pool of relevant papers with PDFs on disk where available,
+which will be handed to downstream extraction and synthesis steps.
 
 Work through Steps 1–4 in order. Do not skip steps. After Step 4, report back a
-summary — the results themselves are already on disk (see Output Contract).
+summary and get the user's approval before scoring (Step 5) or fetching PDFs
+(Step 6) — see Output Contract.
 
 ---
 
@@ -28,6 +29,10 @@ Everything you do flows from this question. Never lose sight of it.
 | `tool/paper_store.py` | `load`/`upsert`/`export_question` — the persistent, human-readable paper store (Step 4) |
 | `tool/run_loop.py` | CLI that runs Steps 2–4 end-to-end from a taxonomy spec and writes into the paper store |
 | `tool/enrich_abstracts.py` | CLI follow-up: fetches abstracts for store records that don't have one yet |
+| `tool/scoring.py` | `heuristic_score`, `similarity_scores` — zero-token metadata/TF-IDF relevance signals (Step 5) |
+| `tool/score_papers.py` | CLI: computes and stores `heuristic_score`/`similarity_score` for every paper on a question, prints a ranked table |
+| `tool/apply_scores.py` | CLI: persists your rubric-based `relevance_score`/`relevance_rationale` per paper into the store (Step 5) |
+| `tool/fetch_pdfs.py` | CLI: downloads PDFs into `brainstorm/<slug>/pdfs/` — open-access first, then institute-network fallback (Step 6) |
 
 Sources are **PubMed, OpenAlex, bioRxiv, and medRxiv** — there is no Semantic
 Scholar integration (its unauthenticated API is unusably rate-limited; OpenAlex
@@ -364,7 +369,7 @@ papers.
 
 ---
 
-## Output Contract
+## Checkpoint After Step 4
 
 At the end of Step 4, the following are already on disk:
 
@@ -382,7 +387,125 @@ Report back to the user with:
 4. Any retrieval failures or warnings encountered
 5. Paths to `brainstorm/<slug>/README.md` and `papers.md`
 
-**Do not proceed to Step 5 (screening) without the user's approval.**
+**Do not proceed to Step 5 (scoring) without the user's approval.**
+
+---
+
+## Step 5 — Score Papers for Relevance
+
+**Goal:** Rank every paper in the store for this question by how important it
+is *for answering the scientific question*, so review effort (yours, or a
+human's) and full-text extraction later go to the right papers first. This is
+scoring/ranking only — nothing gets deleted or excluded at this step.
+
+Quality of the final judgment matters more than the tokens spent getting
+there; the point of splitting this into two passes below is to spend tokens
+only on the judgment call itself, not on mechanical bookkeeping (re-deriving
+a ranking, hand-formatting JSONL edits) that Python can do for free.
+
+### 5.1 — Compute cheap prescreen signals (zero tokens)
+
+```bash
+python tool/score_papers.py --question "..." --slug "..."
+```
+
+This writes two fields onto every matching store record and prints a ranked
+table:
+- `heuristic_score` (0–100): citation velocity (citations/year, log-scaled),
+  how many distinct taxonomy tags the paper matched across rounds (a paper
+  that keeps resurfacing under different cells is more central to the
+  question), and a flat review-article boost.
+- `similarity_score` (0–1): TF-IDF cosine similarity between the question
+  text and the paper's title+abstract — bag-of-words lexical overlap, no
+  embedding API involved. This catches shared terminology but **misses
+  paraphrase and synonym matches** (e.g. a paper that says "distal feedback
+  loop" instead of "tubuloglomerular feedback" scores low here even if
+  it's highly relevant) — treat it as one signal, not the verdict.
+
+Neither signal reads the actual argument of the paper. Use them to decide
+review order, not inclusion/exclusion.
+
+### 5.2 — Rubric-based relevance pass (your judgment)
+
+Read the abstracts — starting from `score_papers.py`'s ranked output, but
+don't stop at an arbitrary cutoff; a paper with a low heuristic/similarity
+score can still be highly relevant (e.g. an under-cited paper using
+different terminology), so skim past the top of the ranking rather than
+truncating it. Batch this (e.g. 15–25 abstracts read together, from
+`brainstorm/<slug>/papers.md`) rather than one API round-trip per paper.
+
+For each paper, assign:
+- `relevance_score` — your judgment of how important this paper is for
+  answering the scientific question. Use a 0–5 scale unless the user asks
+  for something else (0 = off-topic despite matching the query; 5 = directly,
+  substantially relevant).
+- `relevance_rationale` — one sentence on *why* (not a summary of the
+  abstract — the reason for the score).
+
+Write these into a JSON file (paper id → `{relevance_score, relevance_rationale}`;
+ids are the `id` field already on each store record, e.g. `"doi:10.1234/..."`)
+and persist them:
+
+```bash
+python tool/apply_scores.py scores.json --question "..." --slug "..."
+```
+
+This overwrites `relevance_score`/`relevance_rationale` on the named records
+(unlike `paper_store.upsert`, which only ever fills gaps — a re-score here is
+an explicit correction) and refreshes `papers.md`, now sorted with
+`relevance_score` taking priority over the cheap prescreen signals.
+
+### 5.3 — Report back
+
+Report: how many papers were scored, the relevance-score distribution (e.g.
+"12 at 5, 30 at 3–4, ~150 at 0–2"), and anything the heuristic/similarity
+signals got notably wrong (informs whether to trust them more or less next
+round).
+
+---
+
+## Step 6 — Fetch PDFs
+
+**Goal:** Get full-text PDFs onto disk for papers worth reading in full,
+so later extraction doesn't depend on re-fetching from the network per field.
+
+```bash
+python tool/fetch_pdfs.py --question "..." --slug "..." [--limit N]
+```
+
+Per paper, this tries (in order): the `pdf_url` already on the record (open
+access found during retrieval) → an Unpaywall lookup by DOI (aggregates
+open-access copies beyond what OpenAlex/Europe PMC surfaced) → the DOI's
+publisher landing page's `citation_pdf_url` meta tag (works for subscribed
+content only if the current network is recognized by the publisher as a
+subscriber — e.g. an institute connection; otherwise this step just fails
+closed, it never attempts to defeat a paywall). Every download is verified
+to actually be a PDF (`%PDF` magic bytes / `Content-Type`) before being kept,
+so a login or error page is never saved as a false success.
+
+Writes `pdf_path`/`pdf_status` onto each record; papers that end up
+`unavailable` are listed in `brainstorm/<slug>/pdfs/_manual_download_needed.md`
+for manual retrieval. Run with `--limit N` first on a large store to sanity
+check before fetching everything (it makes one or more outbound requests per
+paper, with a politeness delay between them, so it's slow for large stores).
+
+Report back: counts by `pdf_status`, and the path to
+`_manual_download_needed.md` if non-empty.
+
+---
+
+## Output Contract
+
+At the end of Step 6, in addition to the Step 4 checkpoint outputs above:
+
+| Output | Format | Contents |
+|---|---|---|
+| `brainstorm/<slug>/papers.md` | Markdown | Now sorted by `relevance_score` (or the cheap signals if unscored), with score/rationale/pdf-status shown per paper |
+| `brainstorm/<slug>/pdfs/*.pdf` | PDF | Downloaded full texts, filenamed by paper id |
+| `brainstorm/<slug>/pdfs/_manual_download_needed.md` | Markdown | Papers that need manual PDF retrieval (only written if non-empty) |
+| `brainstorm/data/papers.jsonl` | JSONL | Now also carries `heuristic_score`, `similarity_score`, `relevance_score`, `relevance_rationale`, `pdf_path`, `pdf_status` |
+
+**Do not proceed to full-text extraction (`process.md` Step 7) without the user's approval.**
 
 ---
 
@@ -396,3 +519,5 @@ Report back to the user with:
 | Dedup removes > 40% of articles | Jaccard threshold too aggressive, or many true duplicates | Spot-check 10 pairs; if false merges, report to user |
 | A query returns > 100 hits | Query too broad — full-text sources (Europe PMC, OpenAlex) especially can return a lot on a loosely-anchored query | Add a disambiguating AND term, or split into two narrower queries |
 | A query returns 0 hits | Query too narrow, MeSH term not indexed | Try the free-text version; check for typos |
+| `similarity_score` is low on a clearly relevant paper | TF-IDF is lexical, not semantic — the paper uses different terminology than the question | Don't exclude on this signal alone; trust the rubric read (5.2) over it |
+| `fetch_pdfs.py` reports mostly `unavailable` | Papers are paywalled and the current network isn't recognized as a subscriber (no institute VPN/IP) | Expected outside the institute network; use `_manual_download_needed.md` for manual retrieval |

@@ -1,10 +1,12 @@
 # Literature Search Tools
 
-Zero-dependency Python tools implementing Steps 1–4 of the search loop
+Zero-dependency Python tools implementing Steps 1–6 of the search loop
 (`process.md`, `instructions.md`): querying **PubMed**, **OpenAlex**, and
-**bioRxiv/medRxiv** preprints, deduplicating, and building up a durable paper
-store per question. Designed for AI agents conducting literature surveys
-with minimal token consumption.
+**bioRxiv/medRxiv** preprints, deduplicating, scoring, and fetching PDFs into
+a durable paper store per question. Designed for AI agents conducting
+literature surveys — mechanical work (search, dedup, ranking, downloads)
+happens in Python; judgment calls (what's actually relevant) stay with
+whoever is reading the abstracts.
 
 ## Files
 
@@ -15,6 +17,10 @@ with minimal token consumption.
 | `paper_store.py` | Durable JSONL paper store, keyed by question, with Markdown export |
 | `run_loop.py` | CLI runner — Steps 1–4 end-to-end, writes into the paper store |
 | `enrich_abstracts.py` | Follow-up pass: fetches abstracts for store records that don't have one |
+| `scoring.py` | Zero-token relevance signals: `heuristic_score` (metadata) + `similarity_scores` (TF-IDF vs. the question) |
+| `score_papers.py` | CLI: computes/stores the above for a question, prints a ranked table |
+| `apply_scores.py` | CLI: persists rubric-based `relevance_score`/`relevance_rationale` (from actually reading abstracts) into the store |
+| `fetch_pdfs.py` | CLI: downloads PDFs into `brainstorm/<slug>/pdfs/` — open access first, then an institute-network fallback |
 
 ## Output layout
 
@@ -25,6 +31,9 @@ brainstorm/
 ├── <question-slug>/
 │   ├── README.md        <- the question text
 │   ├── papers.md         <- human-readable results for this question
+│   ├── pdfs/
+│   │   ├── *.pdf                        <- downloaded full texts
+│   │   └── _manual_download_needed.md   <- papers that need manual retrieval
 │   └── taxonomy/
 │       └── round_01.py   <- Step-2 query spec, saved for provenance
 └── data/
@@ -82,6 +91,40 @@ python tool/enrich_abstracts.py
 
 Batches PubMed lookups by PMID and looks up bioRxiv/medRxiv abstracts by DOI
 via Europe PMC, then refreshes every affected question's `papers.md`.
+
+### 4. Score for relevance
+
+```bash
+python tool/score_papers.py --question "..." --slug "..."
+```
+
+Writes `heuristic_score` (0–100: citation velocity, taxonomy tag coverage,
+review boost) and `similarity_score` (0–1: TF-IDF cosine similarity to the
+question — lexical, not semantic) onto every paper, and prints a ranked
+table. Neither reads the argument of the paper — they're for prioritizing
+which abstracts to read first, not a verdict.
+
+After reading abstracts and forming a rubric-based judgment, persist it:
+
+```bash
+python tool/apply_scores.py scores.json --question "..." --slug "..."
+```
+
+where `scores.json` is `{paper_id: {"relevance_score": 0-5, "relevance_rationale": "..."}}`.
+This is the score that then drives `papers.md`'s sort order.
+
+### 5. Fetch PDFs
+
+```bash
+python tool/fetch_pdfs.py --question "..." --slug "..." [--limit N]
+```
+
+Tries an open-access `pdf_url`/Unpaywall lookup first, then a
+`citation_pdf_url` meta-tag fetch off the DOI's landing page (works for
+subscribed content only if the current network is recognized by the
+publisher, e.g. an institute connection — never attempts to defeat a
+paywall). Every download is verified to actually be a PDF before being kept.
+Failures land in `brainstorm/<slug>/pdfs/_manual_download_needed.md`.
 
 ---
 

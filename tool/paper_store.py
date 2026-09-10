@@ -22,10 +22,20 @@ brainstorm/ layout (see brainstorm/README.md):
         papers.jsonl   <- the shared store itself; not meant to be read directly
 
 Each record is a normalised article dict (see search_utils.py's schema) plus:
-  id                str   stable key: "doi:<lowercased doi>" or "title:<alpha-only title>"
-  question          str   the question/topic this paper was first retrieved for
-  first_seen_round  int   which round introduced this paper to the store
-  query_tags        list[str]  every taxonomy tag this paper has matched, across all rounds
+  id                  str   stable key: "doi:<lowercased doi>" or "title:<alpha-only title>"
+  question            str   the question/topic this paper was first retrieved for
+  first_seen_round    int   which round introduced this paper to the store
+  query_tags          list[str]  every taxonomy tag this paper has matched, across all rounds
+
+Optionally, once scoring has been run (see `score_papers.py` / `apply_scores.py`):
+  heuristic_score     float 0-100, pure metadata (citation velocity, tag coverage, review boost)
+  similarity_score    float 0-1, TF-IDF cosine similarity to the question text
+  relevance_score     any   rubric-based score assigned after reading the abstract
+  relevance_rationale str   one-line justification for relevance_score
+
+And once PDFs have been fetched (see `fetch_pdfs.py`):
+  pdf_path            str   path to the downloaded PDF, relative to the repo root
+  pdf_status          str   "downloaded:open_access" | "downloaded:institute" | "unavailable" | "error:<msg>"
 
 Usage:
     from tool.paper_store import load, upsert, export_question
@@ -66,6 +76,17 @@ def question_dir(
 ) -> Path:
     """The brainstorm/<slug>/ folder for a given question. Pass an explicit `slug` if you have one."""
     return brainstorm_root / (slug or slugify(question))
+
+
+def safe_filename(paper_id_: str, ext: str) -> str:
+    """
+    Deterministic, filesystem-safe filename for a paper id (e.g.
+    'doi:10.1234/abc' -> 'doi_10.1234_abc.pdf'). Shared by `fetch_pdfs.py`
+    (pdfs/) and `link_summaries.py` (summaries/) so both artifact kinds for
+    the same paper are trivially cross-referenceable by filename alone.
+    """
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", paper_id_)
+    return f"{stem}{ext}"
 
 
 def paper_id(article: Dict[str, Any]) -> str:
@@ -165,6 +186,23 @@ def upsert(
     return new_ids
 
 
+def _rank_value(r: Dict[str, Any]) -> float:
+    """
+    Best-available ranking signal, in order of trust: a rubric-based
+    `relevance_score` (scaled up so any scored paper outranks any unscored
+    one) beats the cheap `heuristic_score`/`similarity_score` combo, which
+    beats a bare citation count for stores that haven't been scored at all.
+    """
+    relevance = r.get("relevance_score")
+    if relevance is not None:
+        return 1_000_000 + float(relevance)
+    heuristic = r.get("heuristic_score")
+    similarity = r.get("similarity_score")
+    if heuristic is not None or similarity is not None:
+        return (heuristic or 0.0) + (similarity or 0.0) * 100
+    return float(r.get("citation_count") or 0)
+
+
 def export_markdown(
     store: Dict[str, Dict[str, Any]],
     out_path: Path,
@@ -174,7 +212,7 @@ def export_markdown(
     records = list(store.values())
     if filter_fn:
         records = [r for r in records if filter_fn(r)]
-    records.sort(key=lambda r: (r.get("question", ""), -int(r.get("citation_count") or 0)))
+    records.sort(key=lambda r: (r.get("question", ""), -_rank_value(r)))
 
     lines = [f"# Paper store ({len(records)} papers)\n"]
     current_question = None
@@ -189,6 +227,19 @@ def export_markdown(
             f"{'review' if r.get('is_review') else ''} | "
             f"tags: `{', '.join(r.get('query_tags', []))}`"
         )
+        score_bits = []
+        if r.get("relevance_score") is not None:
+            score_bits.append(f"relevance: {r['relevance_score']}")
+        if r.get("heuristic_score") is not None:
+            score_bits.append(f"heuristic: {r['heuristic_score']}")
+        if r.get("similarity_score") is not None:
+            score_bits.append(f"similarity: {r['similarity_score']}")
+        if r.get("pdf_status"):
+            score_bits.append(f"pdf: {r['pdf_status']}")
+        if score_bits:
+            lines.append(" | ".join(score_bits))
+        if r.get("relevance_rationale"):
+            lines.append(f"*{r['relevance_rationale']}*")
         abstract = (r.get("abstract") or "").strip()
         if abstract:
             lines.append("")
