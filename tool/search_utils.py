@@ -1,7 +1,7 @@
 """
 search_utils.py — Unified Literature Search Utilities.
 
-Single-file, zero-dependency module for querying PubMed, Semantic Scholar,
+Single-file, zero-dependency module for querying PubMed, OpenAlex,
 and bioRxiv/medRxiv. All functions return a consistent article schema so
 results from different sources can be mixed, deduplicated, and processed
 uniformly in a search loop.
@@ -10,7 +10,7 @@ Unified Article Schema
 ----------------------
 Each article dict contains (empty string/list/0 when unavailable):
 
-  source          str        'pubmed' | 'semantic_scholar' | 'biorxiv' | 'medrxiv'
+  source          str        'pubmed' | 'openalex' | 'biorxiv' | 'medrxiv'
   title           str
   authors         list[str]
   year            str        e.g. '2023'
@@ -20,9 +20,11 @@ Each article dict contains (empty string/list/0 when unavailable):
   doi             str
   url             str        canonical URL for the article
   pdf_url         str        open-access PDF if available, else ''
-  ids             dict       source-specific IDs: pmid, arxiv_id, paper_id, …
-  citation_count  int        (Semantic Scholar only; 0 for others)
-  keywords        list[str]  MeSH terms (PubMed) or fields-of-study (S2)
+  ids             dict       source-specific IDs: pmid, openalex_id, …
+  citation_count  int        (OpenAlex only; 0 for others)
+  keywords        list[str]  MeSH terms (PubMed) or concepts (OpenAlex)
+  pub_types       list[str]  publication types (PubMed/Europe PMC only; [] for OpenAlex)
+  is_review       bool       True if any pub_type mentions "review" (PubMed/Europe PMC only)
   is_preprint     bool
 
 Quick usage
@@ -248,10 +250,14 @@ def _pm_fetch_raw(
                 if el.get("EIdType") == "doi":
                     doi = _pm_clean(el)
                     break
+        pub_types = [
+            _pm_clean(p) for p in art.findall(".//PublicationTypeList/PublicationType")
+            if _pm_clean(p)
+        ]
         item: Dict[str, Any] = {
             "pmid": pmid, "title": title, "authors": authors,
             "journal": journal, "year": date["year"], "pub_date": date["pub_date"],
-            "doi": doi, "pmc": pmc,
+            "doi": doi, "pmc": pmc, "pub_types": pub_types,
             "pubmed_url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
             "abstract": _pm_abstract(art) if include_abstract else "",
         }
@@ -287,93 +293,111 @@ def _pm_search_ids(
 
 
 # ============================================================================
-# Semantic Scholar  (S2AG)
+# OpenAlex
+#
+# Replaces Semantic Scholar (removed): S2's unauthenticated tier was
+# persistently rate-limited (HTTP 429) with no key available. OpenAlex is a
+# free, keyless alternative (a `mailto` contact param buys the "polite pool"
+# rate tier) that still gives citation counts, referenced/citing work ids for
+# future citation-graph work, and concept tags.
 # ============================================================================
 
-_S2_BASE = "https://api.semanticscholar.org/graph/v1"
-_S2_FIELDS = (
-    "paperId,externalIds,title,abstract,authors,year,publicationDate,"
-    "venue,publicationVenue,referenceCount,citationCount,isOpenAccess,"
-    "openAccessPdf,fieldsOfStudy"
-)
-_S2_FIELDS_COMPACT = (
-    "paperId,externalIds,title,authors,year,venue,citationCount,isOpenAccess,openAccessPdf"
-)
+_OA_BASE = "https://api.openalex.org/works"
 
 
-def _s2_parse(raw: Dict[str, Any]) -> Dict[str, Any]:
-    ext = raw.get("externalIds") or {}
-    pid = raw.get("paperId", "")
-    pv = raw.get("publicationVenue") or {}
-    pdf = (raw.get("openAccessPdf") or {}).get("url", "")
+def _oa_reconstruct_abstract(inverted_index: Optional[Dict[str, List[int]]]) -> str:
+    """OpenAlex returns abstracts as a word -> [positions] inverted index; rebuild plain text."""
+    if not inverted_index:
+        return ""
+    positions: List[tuple] = []
+    for word, idxs in inverted_index.items():
+        for idx in idxs:
+            positions.append((idx, word))
+    positions.sort(key=lambda p: p[0])
+    return " ".join(w for _, w in positions)
+
+
+def _oa_parse(raw: Dict[str, Any], compact: bool = False) -> Dict[str, Any]:
+    oa_id = (raw.get("id") or "").rsplit("/", 1)[-1]
+    doi_url = raw.get("doi") or ""
+    doi = doi_url.split("doi.org/", 1)[-1] if doi_url else ""
+    pmid_url = (raw.get("ids") or {}).get("pmid", "")
+    pmid = pmid_url.rsplit("/", 1)[-1] if pmid_url else ""
+
+    authors = [
+        (au.get("author") or {}).get("display_name", "")
+        for au in (raw.get("authorships") or [])
+    ]
+    authors = [a for a in authors if a]
+
+    primary_loc = raw.get("primary_location") or {}
+    source = primary_loc.get("source") or {}
+    oa = raw.get("open_access") or {}
+    pdf_url = primary_loc.get("pdf_url") or oa.get("oa_url") or ""
+
+    concepts = [c["display_name"] for c in (raw.get("concepts") or []) if c.get("display_name")]
+
     return {
-        "paper_id": pid,
-        "title": raw.get("title", ""),
-        "authors": [a["name"] for a in (raw.get("authors") or []) if a.get("name")],
-        "year": str(raw.get("year") or ""),
-        "pub_date": raw.get("publicationDate") or "",
-        "venue": pv.get("name") or raw.get("venue") or "",
-        "citation_count": raw.get("citationCount") or 0,
-        "reference_count": raw.get("referenceCount") or 0,
-        "doi": ext.get("DOI", ""),
-        "arxiv_id": ext.get("ArXiv", ""),
-        "pmid": ext.get("PubMed", ""),
-        "is_open_access": bool(raw.get("isOpenAccess")),
-        "open_access_pdf": pdf,
-        "fields_of_study": raw.get("fieldsOfStudy") or [],
-        "abstract": raw.get("abstract") or "",
-        "url": f"https://www.semanticscholar.org/paper/{pid}" if pid else "",
+        "openalex_id": oa_id,
+        "title": raw.get("title", "") or "",
+        "authors": authors,
+        "year": raw.get("publication_year") or "",
+        "pub_date": raw.get("publication_date", "") or "",
+        "venue": source.get("display_name", "") or "",
+        "citation_count": raw.get("cited_by_count") or 0,
+        "doi": doi,
+        "pmid": pmid,
+        "url": doi_url or (raw.get("id") or ""),
+        "pdf_url": pdf_url,
+        "concepts": concepts,
+        "is_preprint": (raw.get("type") or "") == "preprint",
+        "abstract": "" if compact else _oa_reconstruct_abstract(raw.get("abstract_inverted_index")),
     }
 
 
-def _s2_headers(api_key: Optional[str] = None) -> Dict[str, str]:
-    key = api_key or os.getenv("S2_API_KEY")
-    h = {"Accept": "application/json"}
-    if key:
-        h["x-api-key"] = key
-    return h
-
-
-def _s2_search_raw(
+def _oa_search_raw(
     query: str,
     max_results: int = 10,
     year_range: Optional[str] = None,
-    fields_of_study: Optional[List[str]] = None,
     compact: bool = False,
-    sort: str = "Relevance",
-    api_key: Optional[str] = None,
+    mailto: Optional[str] = None,
 ) -> Dict[str, Any]:
     params: Dict[str, Any] = {
-        "query": query,
-        "limit": min(max_results, 100),
-        "fields": _S2_FIELDS_COMPACT if compact else _S2_FIELDS,
-        "sort": sort,
+        "search": query,
+        "per-page": min(max_results, 100),
+        "mailto": mailto or os.getenv("OPENALEX_EMAIL"),
     }
-    if fields_of_study:
-        params["fieldsOfStudy"] = ",".join(fields_of_study)
     if year_range:
-        params["year"] = year_range
-    qs = urllib.parse.urlencode(params)
-    raw = _http_get(f"{_S2_BASE}/paper/search?{qs}", headers=_s2_headers(api_key))
+        # Accept '2018-2024' or a single year; OpenAlex wants a from/to filter.
+        if "-" in year_range:
+            start, end = year_range.split("-", 1)
+            params["filter"] = f"from_publication_date:{start}-01-01,to_publication_date:{end}-12-31"
+        else:
+            params["filter"] = f"publication_year:{year_range}"
+    qs = urllib.parse.urlencode({k: v for k, v in params.items() if v})
+    raw = _http_get(f"{_OA_BASE}?{qs}")
     data = json.loads(raw)
-    papers = [_s2_parse(p) for p in (data.get("data") or [])]
-    return {"total": data.get("total", 0), "papers": papers}
+    papers = [_oa_parse(p, compact) for p in (data.get("results") or [])]
+    return {"total": (data.get("meta") or {}).get("count", 0), "papers": papers}
 
 
-def _s2_batch_raw(
-    paper_ids: List[str],
+def _oa_batch_raw(
+    dois: List[str],
     compact: bool = False,
-    api_key: Optional[str] = None,
+    mailto: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    fields = _S2_FIELDS_COMPACT if compact else _S2_FIELDS
-    qs = urllib.parse.urlencode({"fields": fields})
-    body = json.dumps({"ids": paper_ids}).encode()
-    raw = _http_post(
-        f"{_S2_BASE}/paper/batch?{qs}",
-        body=body,
-        extra_headers=_s2_headers(api_key),
-    )
-    return [_s2_parse(p) for p in json.loads(raw) if p]
+    if not dois:
+        return []
+    results: List[Dict[str, Any]] = []
+    for i in range(0, len(dois), 50):
+        chunk = dois[i:i + 50]
+        filt = "doi:" + "|".join(urllib.parse.quote(d, safe="") for d in chunk)
+        params = {"filter": filt, "per-page": len(chunk), "mailto": mailto or os.getenv("OPENALEX_EMAIL")}
+        qs = urllib.parse.urlencode({k: v for k, v in params.items() if v})
+        raw = _http_get(f"{_OA_BASE}?{qs}")
+        data = json.loads(raw)
+        results.extend(_oa_parse(p, compact) for p in (data.get("results") or []))
+    return results
 
 
 # ============================================================================
@@ -435,6 +459,7 @@ def _rxiv_parse(raw: Dict[str, Any], server: str) -> Dict[str, Any]:
             break
 
     url = f"https://doi.org/{doi}" if doi else ""
+    pub_types = (raw.get("pubTypeList") or {}).get("pubType", [])
 
     return {
         "doi": doi,
@@ -448,6 +473,7 @@ def _rxiv_parse(raw: Dict[str, Any], server: str) -> Dict[str, Any]:
         "abstract": raw.get("abstractText", ""),
         "url": url,
         "pdf_url": pdf_url,
+        "pub_types": pub_types,
         "published": published,
     }
 
@@ -518,13 +544,15 @@ def _norm_pubmed(a: Dict[str, Any]) -> Dict[str, Any]:
         "ids": {"pmid": pmid, "pmc": a.get("pmc", ""), "doi": a.get("doi", "")},
         "citation_count": 0,
         "keywords": a.get("mesh_terms", []),
+        "pub_types": a.get("pub_types", []),
+        "is_review": any("review" in t.lower() for t in a.get("pub_types", [])),
         "is_preprint": False,
     }
 
 
-def _norm_s2(a: Dict[str, Any]) -> Dict[str, Any]:
+def _norm_openalex(a: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "source": "semantic_scholar",
+        "source": "openalex",
         "title": a.get("title", ""),
         "authors": a.get("authors", []),
         "year": str(a.get("year", "")),
@@ -533,16 +561,19 @@ def _norm_s2(a: Dict[str, Any]) -> Dict[str, Any]:
         "abstract": a.get("abstract", ""),
         "doi": a.get("doi", ""),
         "url": a.get("url", ""),
-        "pdf_url": a.get("open_access_pdf", ""),
+        "pdf_url": a.get("pdf_url", ""),
         "ids": {
-            "paper_id": a.get("paper_id", ""),
+            "openalex_id": a.get("openalex_id", ""),
             "doi": a.get("doi", ""),
-            "arxiv_id": a.get("arxiv_id", ""),
             "pmid": a.get("pmid", ""),
         },
         "citation_count": a.get("citation_count", 0),
-        "keywords": a.get("fields_of_study", []),
-        "is_preprint": False,
+        "keywords": a.get("concepts", []),
+        # OpenAlex's `type` field is too coarse (mostly just "article") to reliably
+        # signal review vs. original research; rely on PubMed/Europe PMC for that.
+        "pub_types": [],
+        "is_review": False,
+        "is_preprint": a.get("is_preprint", False),
     }
 
 
@@ -566,6 +597,8 @@ def _norm_rxiv(a: Dict[str, Any]) -> Dict[str, Any]:
         },
         "citation_count": 0,
         "keywords": [a["category"]] if a.get("category") else [],
+        "pub_types": a.get("pub_types", []),
+        "is_review": any("review" in t.lower() for t in a.get("pub_types", [])),
         "is_preprint": not bool(a.get("published", "")),
     }
 
@@ -612,56 +645,44 @@ def fetch_pubmed_by_pmids(
     return [_norm_pubmed(a) for a in raw]
 
 
-def search_semantic_scholar(
+def search_openalex(
     query: str,
     max_results: int = 10,
     year_range: Optional[str] = None,
-    fields_of_study: Optional[List[str]] = None,
     compact: bool = False,
-    sort: str = "Relevance",
-    api_key: Optional[str] = None,
+    mailto: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Search Semantic Scholar.
+    Search OpenAlex.
+
+    Note: OpenAlex's `search` parameter does relevance-ranked full-text matching
+    on the whole query string — it does not parse PubMed/Europe-PMC-style
+    boolean syntax (quotes still work as exact phrases, but AND/OR/parentheses
+    are not honored as operators). Complex boolean queries built for the other
+    sources will still work here, just with somewhat looser precision.
 
     Args:
         query: Free-text search string.
         max_results: Max articles (up to 100 per request).
         year_range: e.g. '2018-2024' or '2020'.
-        fields_of_study: e.g. ['Medicine', 'Biology'].
-        compact: Omit abstracts/fields-of-study.
-        sort: 'Relevance' (default), 'CitationCount', or 'PublicationDate'.
-        api_key: S2 API key or set S2_API_KEY env var.
+        compact: Omit abstracts.
+        mailto: Contact email for OpenAlex's "polite pool" (or set OPENALEX_EMAIL).
 
     Returns:
         List of normalised article dicts.
     """
-    res = _s2_search_raw(query, max_results, year_range, fields_of_study, compact, sort, api_key)
-    arts = res["papers"]
-    if compact:
-        for a in arts:
-            a.pop("abstract", None)
-            a.pop("fields_of_study", None)
-    return [_norm_s2(a) for a in arts]
+    res = _oa_search_raw(query, max_results, year_range, compact, mailto)
+    return [_norm_openalex(a) for a in res["papers"]]
 
 
-def fetch_s2_by_ids(
-    paper_ids: List[str],
+def fetch_openalex_by_dois(
+    dois: List[str],
     compact: bool = False,
-    api_key: Optional[str] = None,
+    mailto: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch Semantic Scholar papers by ID.
-
-    IDs may be: DOI:10.x/y  ARXIV:1234.56789  CorpusId:12345  or raw S2 hex.
-    Returns normalised article dicts.
-    """
-    raw = _s2_batch_raw(paper_ids, compact, api_key)
-    if compact:
-        for a in raw:
-            a.pop("abstract", None)
-            a.pop("fields_of_study", None)
-    return [_norm_s2(a) for a in raw]
+    """Fetch OpenAlex works by DOI list. Returns normalised article dicts."""
+    raw = _oa_batch_raw(dois, compact, mailto)
+    return [_norm_openalex(a) for a in raw]
 
 
 def search_biorxiv(
@@ -729,7 +750,7 @@ def search_all(
     date_range: str = _DEFAULT_DATE_RANGE,
     pubmed_api_key: Optional[str] = None,
     pubmed_email: Optional[str] = None,
-    s2_api_key: Optional[str] = None,
+    openalex_mailto: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Query multiple sources and return a combined, deduplicated list.
@@ -738,28 +759,28 @@ def search_all(
         query: Search terms used across all sources.
         max_results: Max articles *per source*.
         sources: Which sources to query. Defaults to all four:
-                 ['pubmed', 'semantic_scholar', 'biorxiv', 'medrxiv'].
+                 ['pubmed', 'openalex', 'biorxiv', 'medrxiv'].
         compact: Omit abstracts from all results (good for broad sweeps).
-        year_range: Year filter for Semantic Scholar, e.g. '2018-2024'.
+        year_range: Year filter for OpenAlex, e.g. '2018-2024'.
         date_range: Date filter for preprint servers.
         pubmed_api_key: NCBI API key (or NCBI_API_KEY env var).
         pubmed_email: NCBI email (or NCBI_EMAIL env var).
-        s2_api_key: Semantic Scholar API key (or S2_API_KEY env var).
+        openalex_mailto: Contact email for OpenAlex's polite pool (or OPENALEX_EMAIL env var).
 
     Returns:
         Deduplicated list of normalised article dicts.
     """
     if sources is None:
-        sources = ["pubmed", "semantic_scholar", "biorxiv", "medrxiv"]
+        sources = ["pubmed", "openalex", "biorxiv", "medrxiv"]
 
     all_articles: List[Dict[str, Any]] = []
     _dispatch = {
         "pubmed": lambda: search_pubmed(query, max_results, compact=compact,
                                          api_key=pubmed_api_key, email=pubmed_email),
-        "semantic_scholar": lambda: search_semantic_scholar(query, max_results,
-                                                             year_range=year_range,
-                                                             compact=compact,
-                                                             api_key=s2_api_key),
+        "openalex": lambda: search_openalex(query, max_results,
+                                            year_range=year_range,
+                                            compact=compact,
+                                            mailto=openalex_mailto),
         "biorxiv": lambda: search_biorxiv(query, max_results, date_range, compact),
         "medrxiv": lambda: search_medrxiv(query, max_results, date_range, compact),
     }
@@ -792,7 +813,7 @@ def run_batch(
     rxiv_delay: float = 1.1,
     pubmed_api_key: Optional[str] = None,
     pubmed_email: Optional[str] = None,
-    s2_api_key: Optional[str] = None,
+    openalex_mailto: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Run a batch of queries across multiple sources with a single dedup pass.
@@ -811,18 +832,18 @@ def run_batch(
         max_per_query: Max articles per query per source.
         compact: Omit abstracts (recommended for broad sweeps).
         query_tags: Optional {query: tag} mapping for taxonomy labels.
-        year_range: Year filter for Semantic Scholar.
+        year_range: Year filter for OpenAlex.
         date_range: Date filter for bioRxiv/medRxiv.
         rxiv_delay: Seconds between bioRxiv/medRxiv requests (default 1.1).
         pubmed_api_key: NCBI API key (or NCBI_API_KEY env var).
         pubmed_email: NCBI email (or NCBI_EMAIL env var).
-        s2_api_key: Semantic Scholar API key (or S2_API_KEY env var).
+        openalex_mailto: Contact email for OpenAlex's polite pool (or OPENALEX_EMAIL env var).
 
     Returns:
         Flat deduplicated list of normalised article dicts with provenance.
     """
     if sources is None:
-        sources = ["pubmed", "semantic_scholar", "biorxiv", "medrxiv"]
+        sources = ["pubmed", "openalex", "biorxiv", "medrxiv"]
     if query_tags is None:
         query_tags = {}
 
@@ -837,11 +858,11 @@ def run_batch(
                 if src == "pubmed":
                     arts = search_pubmed(query, max_per_query, compact=compact,
                                          api_key=pubmed_api_key, email=pubmed_email)
-                elif src == "semantic_scholar":
-                    arts = search_semantic_scholar(query, max_per_query,
-                                                    year_range=year_range,
-                                                    compact=compact,
-                                                    api_key=s2_api_key)
+                elif src == "openalex":
+                    arts = search_openalex(query, max_per_query,
+                                           year_range=year_range,
+                                           compact=compact,
+                                           mailto=openalex_mailto)
                 elif src == "biorxiv":
                     arts = search_biorxiv(query, max_per_query, date_range, compact)
                 elif src == "medrxiv":
@@ -913,7 +934,7 @@ def deduplicate(
          — catches preprint-vs-published pairs with differing subtitles.
 
     When duplicates are found the copy from the higher-preference source is kept.
-    Default preference: pubmed > semantic_scholar > biorxiv > medrxiv.
+    Default preference: pubmed > openalex > biorxiv > medrxiv.
 
     Args:
         articles: Mixed list of normalised article dicts.
@@ -923,7 +944,7 @@ def deduplicate(
         Deduplicated list preserving first-occurrence order.
     """
     if prefer_sources is None:
-        prefer_sources = ["pubmed", "semantic_scholar", "biorxiv", "medrxiv"]
+        prefer_sources = ["pubmed", "openalex", "biorxiv", "medrxiv"]
     rank = {s: i for i, s in enumerate(prefer_sources)}
 
     seen_doi: Dict[str, int] = {}

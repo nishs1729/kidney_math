@@ -8,14 +8,14 @@ if _REPO_ROOT not in sys.path:
 
 from .search_utils import (
     search_pubmed,
-    search_semantic_scholar,
+    search_openalex,
     search_biorxiv,
     search_medrxiv,
     search_all,
     run_batch,
     deduplicate,
     fetch_pubmed_by_pmids,
-    fetch_s2_by_ids,
+    fetch_openalex_by_dois,
     extract_dois,
     extract_titles,
     get_mesh_terms,
@@ -24,14 +24,14 @@ from .search_utils import (
 
 __all__ = [
     "search_pubmed",
-    "search_semantic_scholar",
+    "search_openalex",
     "search_biorxiv",
     "search_medrxiv",
     "search_all",
     "run_batch",
     "deduplicate",
     "fetch_pubmed_by_pmids",
-    "fetch_s2_by_ids",
+    "fetch_openalex_by_dois",
     "extract_dois",
     "extract_titles",
     "get_mesh_terms",

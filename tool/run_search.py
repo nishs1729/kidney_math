@@ -2,14 +2,14 @@
 """
 run_search.py — Literature Search Runner.
 
-Executes a keyword search across PubMed, Semantic Scholar, and bioRxiv/medRxiv,
+Executes a keyword search across PubMed, OpenAlex, and bioRxiv/medRxiv,
 deduplicates results, and saves a clean Markdown report (+ optional JSON) to
 the brainstorm/ directory.
 
 Usage:
   python tool/run_search.py "SGLT2 kidney tubule transport"
   python tool/run_search.py "renal hemodynamics autoregulation" -n 15 --compact
-  python tool/run_search.py "glomerular filtration model" --sources pubmed semantic_scholar
+  python tool/run_search.py "glomerular filtration model" --sources pubmed openalex
   python tool/run_search.py "CKD progression biomarkers" --year 2020-2024 --save-json
 """
 
@@ -57,7 +57,7 @@ from tool.search_utils import search_all, deduplicate, run_batch
 def _source_badge(source: str) -> str:
     badges = {
         "pubmed": "PubMed",
-        "semantic_scholar": "Semantic Scholar",
+        "openalex": "OpenAlex",
         "biorxiv": "bioRxiv",
         "medrxiv": "medRxiv",
     }
@@ -204,8 +204,8 @@ def main():
     parser.add_argument(
         "--sources",
         nargs="+",
-        choices=["pubmed", "semantic_scholar", "biorxiv", "medrxiv"],
-        default=["pubmed", "semantic_scholar", "biorxiv", "medrxiv"],
+        choices=["pubmed", "openalex", "biorxiv", "medrxiv"],
+        default=["pubmed", "openalex", "biorxiv", "medrxiv"],
         help="Sources to query (default: all four)",
         metavar="SOURCE",
     )
@@ -218,7 +218,7 @@ def main():
     parser.add_argument(
         "--year",
         default=None,
-        help="Year range for Semantic Scholar, e.g. '2018-2024' or '2022'",
+        help="Year range for OpenAlex, e.g. '2018-2024' or '2022'",
     )
     parser.add_argument(
         "--date-range",
@@ -251,9 +251,9 @@ def main():
         help="NCBI contact email (or set NCBI_EMAIL)",
     )
     parser.add_argument(
-        "--s2-api-key",
-        default=os.getenv("S2_API_KEY"),
-        help="Semantic Scholar API key (or set S2_API_KEY)",
+        "--openalex-email",
+        default=os.getenv("OPENALEX_EMAIL"),
+        help="Contact email for OpenAlex's polite pool (or set OPENALEX_EMAIL)",
     )
 
     args = parser.parse_args()
@@ -293,7 +293,7 @@ def main():
             date_range=args.date_range,
             pubmed_api_key=args.pubmed_api_key,
             pubmed_email=args.pubmed_email,
-            s2_api_key=args.s2_api_key,
+            openalex_mailto=args.openalex_email,
         )
         effective_query = f"batch:{queries_path.name}"
     # --- Single query mode ---
@@ -310,7 +310,7 @@ def main():
             date_range=args.date_range,
             pubmed_api_key=args.pubmed_api_key,
             pubmed_email=args.pubmed_email,
-            s2_api_key=args.s2_api_key,
+            openalex_mailto=args.openalex_email,
         )
         effective_query = args.query
 
