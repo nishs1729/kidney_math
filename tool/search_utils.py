@@ -26,6 +26,8 @@ Each article dict contains (empty string/list/0 when unavailable):
   pub_types       list[str]  publication types (PubMed/Europe PMC only; [] for OpenAlex)
   is_review       bool       True if any pub_type mentions "review" (PubMed/Europe PMC only)
   is_preprint     bool
+  referenced_works   list[str]  OpenAlex short IDs this paper cites (OpenAlex only; [] otherwise)
+  cited_by_api_url   str        ready-made OpenAlex URL for this paper's citing works (OpenAlex only; '' otherwise)
 
 Quick usage
 -----------
@@ -338,6 +340,16 @@ def _oa_parse(raw: Dict[str, Any], compact: bool = False) -> Dict[str, Any]:
 
     concepts = [c["display_name"] for c in (raw.get("concepts") or []) if c.get("display_name")]
 
+    # Short OpenAlex work IDs (e.g. "W2741809807") for citation-graph expansion:
+    # `referenced_works` is this paper's backward references. Forward citations
+    # have no ready-made URL field on the work object (OpenAlex dropped
+    # `cited_by_api_url`, confirmed against a live work fetch) — build the
+    # standard `cites:` filter URL ourselves; fetch_citing_works just pages it.
+    referenced_works = [
+        w.rsplit("/", 1)[-1] for w in (raw.get("referenced_works") or []) if w
+    ]
+    cited_by_api_url = f"{_OA_BASE}?filter=cites:{oa_id}" if oa_id else ""
+
     return {
         "openalex_id": oa_id,
         "title": raw.get("title", "") or "",
@@ -353,6 +365,8 @@ def _oa_parse(raw: Dict[str, Any], compact: bool = False) -> Dict[str, Any]:
         "concepts": concepts,
         "is_preprint": (raw.get("type") or "") == "preprint",
         "abstract": "" if compact else _oa_reconstruct_abstract(raw.get("abstract_inverted_index")),
+        "referenced_works": referenced_works,
+        "cited_by_api_url": cited_by_api_url,
     }
 
 
@@ -424,6 +438,45 @@ def _oa_batch_raw(
         data = json.loads(raw)
         results.extend(_oa_parse(p, compact) for p in (data.get("results") or []))
     return results
+
+
+def _oa_batch_by_ids_raw(
+    openalex_ids: List[str],
+    compact: bool = False,
+    mailto: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not openalex_ids:
+        return []
+    results: List[Dict[str, Any]] = []
+    for i in range(0, len(openalex_ids), 50):
+        chunk = openalex_ids[i:i + 50]
+        params = {
+            "filter": "openalex_id:" + "|".join(chunk),
+            "per-page": len(chunk),
+            "mailto": mailto or os.getenv("OPENALEX_EMAIL"),
+        }
+        qs = urllib.parse.urlencode({k: v for k, v in params.items() if v})
+        raw = _http_get(f"{_OA_BASE}?{qs}")
+        data = json.loads(raw)
+        results.extend(_oa_parse(p, compact) for p in (data.get("results") or []))
+    return results
+
+
+def _oa_citing_raw(
+    cited_by_api_url: str,
+    max_results: int = 25,
+    compact: bool = False,
+    mailto: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """`cited_by_api_url` is a ready-made OpenAlex query URL (from _oa_parse) — just page it."""
+    if not cited_by_api_url:
+        return []
+    sep = "&" if "?" in cited_by_api_url else "?"
+    params = {"per-page": min(max_results, 100), "mailto": mailto or os.getenv("OPENALEX_EMAIL")}
+    qs = urllib.parse.urlencode({k: v for k, v in params.items() if v})
+    raw = _http_get(f"{cited_by_api_url}{sep}{qs}")
+    data = json.loads(raw)
+    return [_oa_parse(p, compact) for p in (data.get("results") or [])]
 
 
 # ============================================================================
@@ -573,6 +626,8 @@ def _norm_pubmed(a: Dict[str, Any]) -> Dict[str, Any]:
         "pub_types": a.get("pub_types", []),
         "is_review": any("review" in t.lower() for t in a.get("pub_types", [])),
         "is_preprint": False,
+        "referenced_works": [],
+        "cited_by_api_url": "",
     }
 
 
@@ -600,6 +655,8 @@ def _norm_openalex(a: Dict[str, Any]) -> Dict[str, Any]:
         "pub_types": [],
         "is_review": False,
         "is_preprint": a.get("is_preprint", False),
+        "referenced_works": a.get("referenced_works", []),
+        "cited_by_api_url": a.get("cited_by_api_url", ""),
     }
 
 
@@ -626,6 +683,8 @@ def _norm_rxiv(a: Dict[str, Any]) -> Dict[str, Any]:
         "pub_types": a.get("pub_types", []),
         "is_review": any("review" in t.lower() for t in a.get("pub_types", [])),
         "is_preprint": not bool(a.get("published", "")),
+        "referenced_works": [],
+        "cited_by_api_url": "",
     }
 
 
@@ -708,6 +767,35 @@ def fetch_openalex_by_dois(
 ) -> List[Dict[str, Any]]:
     """Fetch OpenAlex works by DOI list. Returns normalised article dicts."""
     raw = _oa_batch_raw(dois, compact, mailto)
+    return [_norm_openalex(a) for a in raw]
+
+
+def fetch_openalex_by_ids(
+    openalex_ids: List[str],
+    compact: bool = False,
+    mailto: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch OpenAlex works by short OpenAlex ID (e.g. 'W2741809807', as found in
+    a paper's `referenced_works` field). For citation-graph expansion —
+    backward references.
+    """
+    raw = _oa_batch_by_ids_raw(openalex_ids, compact, mailto)
+    return [_norm_openalex(a) for a in raw]
+
+
+def fetch_citing_works(
+    cited_by_api_url: str,
+    max_results: int = 25,
+    compact: bool = False,
+    mailto: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch works that cite a given paper, via the `cited_by_api_url` OpenAlex
+    already provides on its record (a ready-made query URL — this just pages
+    it). For citation-graph expansion — forward citations.
+    """
+    raw = _oa_citing_raw(cited_by_api_url, max_results, compact, mailto)
     return [_norm_openalex(a) for a in raw]
 
 

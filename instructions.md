@@ -1,13 +1,22 @@
-# AI Agent Instructions: Literature Search Loop (Steps 1–6)
+# AI Agent Instructions: Literature Search Loop (Steps 1–11)
 
 You are a literature search agent. You have been given a **scientific question**.
 Your task is to execute the following steps of the search loop to build a clean,
-deduplicated, scored pool of relevant papers with PDFs on disk where available,
-which will be handed to downstream extraction and synthesis steps.
+deduplicated pool of relevant papers, get their PDFs on disk, write a structured
+scientific summary of each one, score them for relevance, and then **iteratively
+refine** the pool: triage by score, expand outward along the citation graph from
+what's already confirmed relevant, refresh the taxonomy from what that surfaced,
+and loop back to Step 2 — until new rounds stop paying off.
 
 Work through Steps 1–4 in order. Do not skip steps. After Step 4, report back a
-summary and get the user's approval before scoring (Step 5) or fetching PDFs
-(Step 6) — see Output Contract.
+summary and get the user's approval before fetching PDFs (Step 5), summarizing
+(Step 6), scoring (Step 7), or starting the refinement loop (Step 8 onward) —
+see the checkpoints between each.
+
+Steps 5–8 (fetch PDFs, summarize, score, triage) apply to **every round's new
+papers** — the first round's search results, and every later round's
+citation-expansion or taxonomy-refresh additions alike. Don't treat them as
+one-time setup only.
 
 ---
 
@@ -29,10 +38,14 @@ Everything you do flows from this question. Never lose sight of it.
 | `tool/paper_store.py` | `load`/`upsert`/`export_question` — the persistent, human-readable paper store (Step 4) |
 | `tool/run_loop.py` | CLI that runs Steps 2–4 end-to-end from a taxonomy spec and writes into the paper store |
 | `tool/enrich_abstracts.py` | CLI follow-up: fetches abstracts for store records that don't have one yet |
-| `tool/scoring.py` | `heuristic_score`, `similarity_scores` — zero-token metadata/TF-IDF relevance signals (Step 5) |
+| `tool/fetch_pdfs.py` | CLI: downloads PDFs into `brainstorm/<slug>/pdfs/` — open-access first, then institute-network fallback, then a manual-placement check (Step 5) |
+| `tool/link_summaries.py` | CLI: scans `brainstorm/<slug>/summaries/` and registers written summaries back into the store (Step 6) |
+| `tool/scoring.py` | `heuristic_score`, `similarity_scores` — zero-token metadata/TF-IDF relevance signals (Step 7) |
 | `tool/score_papers.py` | CLI: computes and stores `heuristic_score`/`similarity_score` for every paper on a question, prints a ranked table |
-| `tool/apply_scores.py` | CLI: persists your rubric-based `relevance_score`/`relevance_rationale` per paper into the store (Step 5) |
-| `tool/fetch_pdfs.py` | CLI: downloads PDFs into `brainstorm/<slug>/pdfs/` — open-access first, then institute-network fallback (Step 6) |
+| `tool/apply_scores.py` | CLI: persists your rubric-based `relevance_score`/`relevance_rationale` per paper into the store (Step 7) |
+| `tool/triage_papers.py` | CLI: buckets papers into `status` core/borderline/excluded from `relevance_score`, writes `core_papers.md` (Step 8) |
+| `tool/expand_citations.py` | CLI: pulls backward references + forward citations for core-tier papers via OpenAlex, adds new candidates (Step 9) |
+| `tool/round_report.py` | CLI: per-round and per-taxonomy-tag yield report, plus a saturation verdict (Steps 10–11) |
 
 Sources are **PubMed, OpenAlex, bioRxiv, and medRxiv** — there is no Semantic
 Scholar integration (its unauthenticated API is unusably rate-limited; OpenAlex
@@ -387,23 +400,173 @@ Report back to the user with:
 4. Any retrieval failures or warnings encountered
 5. Paths to `brainstorm/<slug>/README.md` and `papers.md`
 
-**Do not proceed to Step 5 (scoring) without the user's approval.**
+**Do not proceed to Step 5 (fetching PDFs) without the user's approval.**
 
 ---
 
-## Step 5 — Score Papers for Relevance
+## Step 5 — Fetch PDFs
+
+**Goal:** Get full-text PDFs onto disk for as many papers as possible, since
+Step 6's summaries should be written from full text wherever available, not
+the abstract alone.
+
+### 5.1 — Run it
+
+```bash
+python tool/fetch_pdfs.py --question "..." --slug "..." [--limit N]
+```
+
+Per paper, this tries (in order): a file already sitting at the expected
+destination (see 5.3) → the `pdf_url` already on the record (open access
+found during retrieval) → an Unpaywall lookup by DOI (aggregates open-access
+copies beyond what OpenAlex/Europe PMC surfaced) → the DOI's publisher
+landing page's `citation_pdf_url` meta tag (works for subscribed content
+only if the current network is recognized by the publisher as a subscriber
+— e.g. an institute connection; otherwise this step just fails closed, it
+never attempts to defeat a paywall). Every download is verified to actually
+be a PDF (`%PDF` magic bytes / `Content-Type`) before being kept, so a login
+or error page is never saved as a false success.
+
+Writes `pdf_path`/`pdf_status` onto each record. Run with `--limit N` first
+on a large store to sanity check before fetching everything (it makes one or
+more outbound requests per paper, with a politeness delay between them, so
+it's slow for large stores).
+
+### 5.2 — Report back and pause for manual downloads
+
+Report counts by `pdf_status`. Papers that end up `unavailable` are listed in
+`brainstorm/<slug>/pdfs/_manual_download_needed.md`, one entry per paper with
+its DOI/URL and the **exact filename** it must be saved as to be picked up
+automatically.
+
+**Stop here and hand this list to the user before proceeding to Step 6.**
+They may have access (a personal subscription, an institute connection you
+don't have, an author's personal copy) that this script doesn't. Don't
+summarize from an abstract-only fallback for a paper still sitting in this
+list without giving the user the chance to supply the PDF first.
+
+### 5.3 — Pick up manual downloads
+
+Once the user has placed any PDFs (in `brainstorm/<slug>/pdfs/`, using the
+filenames from `_manual_download_needed.md`) — or has told you to proceed
+without them — re-run the same command from 5.1, **without `--force`**:
+
+```bash
+python tool/fetch_pdfs.py --question "..." --slug "..."
+```
+
+A plain re-run only retries papers that are still missing or came back
+`unavailable`/`error:*`; anything already downloaded is left untouched, and
+any manually-placed file is picked up with no network call and marked
+`pdf_status: downloaded:manual`. Repeat 5.2/5.3 as many times as the user
+wants; move on once they say so.
+
+---
+
+## Step 6 — Summarize Papers
+
+**Goal:** For every paper, produce a structured scientific summary — written
+from the full-text PDF when available, from the abstract alone otherwise —
+that Step 7's relevance judgment (and later extraction) can be based on
+instead of re-reading raw text each time.
+
+Quality matters more than token cost here: read the actual paper, don't
+paraphrase the abstract into extra paragraphs. That said, don't waste effort
+either — see the batching note in 6.2.
+
+### 6.1 — Summary template
+
+One Markdown file per paper, at `brainstorm/<slug>/summaries/<file>.md`,
+using the exact filename `tool.paper_store.safe_filename(paper_id, ".md")`
+would produce for that paper's `id` (so `link_summaries.py` in 6.3 can find
+it — check with `python -c "from tool.paper_store import safe_filename; print(safe_filename('<id>', '.md'))"`
+if unsure). Structure (adjust section names/count to what the paper actually
+offers — don't force a section that has nothing to say):
+
+```markdown
+# <Title>
+
+**Source:** <full text | abstract only — no PDF available>
+**Authors:** ... | **Year:** ... | **Venue:** ... | **DOI:** ...
+
+## Aim / Research Question
+What the paper set out to do.
+
+## Modeling Approach
+The actual equations/system type, key assumptions, what's novel about the
+formalism — this is the section a generic summary would skip, and the one
+this survey cares about most. Omit if the paper isn't itself a modeling paper
+(e.g. a pure experimental or review paper) rather than forcing content here.
+
+## Key Results
+The paper's main findings.
+
+## Discussion / Interpretation
+What the authors think their results mean.
+
+## Limitations / Problems
+What the authors themselves flag as weak, unresolved, or out of scope.
+
+## Gaps / Open Questions
+Explicit or implied directions not covered by this paper — feeds into
+taxonomy refinement (`process.md` Step 9) later, separate from evaluation.
+
+## Relevance to Our Question
+One paragraph explicitly tying this paper back to the scientific question at
+the top of this document. This is the paragraph Step 7 leans on most.
+```
+
+If `pdf_status` isn't a `downloaded:*` value, write the summary from the
+abstract alone and set **Source: abstract only — no PDF available** — don't
+skip the paper, but don't invent Modeling-Approach/Results detail an abstract
+doesn't support either; shorter sections (or omitting one entirely) are
+correct in that case, not a gap to paper over.
+
+### 6.2 — Work in batches, PDF-read via the `Read` tool
+
+Read a downloaded PDF directly (page-ranged if it's long) — no extra library
+needed. Process in batches (e.g. 10–15 papers), starting from whatever
+ordering is available (existing `heuristic_score`/`similarity_score` from a
+prior round, or just `pdf_status: downloaded:*` before `unavailable`/
+abstract-only). After the **first** batch, pause and show the user 1–2
+example summaries before continuing to the rest, in case the template or
+depth needs adjusting — cheaper to fix after 10 papers than after 200.
+
+### 6.3 — Register the summaries
+
+After each batch (or at the end):
+
+```bash
+python tool/link_summaries.py --question "..." --slug "..."
+```
+
+Scans `brainstorm/<slug>/summaries/`, sets `summary_path`/`summary_status`
+on every matching record, refreshes `papers.md`, and reports how many
+summaries are written vs. still missing — use this count to track progress
+across batches instead of re-deriving it by hand.
+
+### 6.4 — Report back
+
+Report: how many papers were summarized (full-text vs. abstract-only split),
+how many are still missing (if stopping partway through a large store), and
+anything notable found while reading (a paper that turned out off-topic
+despite matching the query, a recurring gap across papers, etc.).
+
+---
+
+## Step 7 — Score Papers for Relevance
 
 **Goal:** Rank every paper in the store for this question by how important it
-is *for answering the scientific question*, so review effort (yours, or a
-human's) and full-text extraction later go to the right papers first. This is
-scoring/ranking only — nothing gets deleted or excluded at this step.
+is *for answering the scientific question*, using the Step 6 summary (richer
+than the abstract alone) as the primary evidence. This is scoring/ranking
+only — nothing gets deleted or excluded at this step.
 
 Quality of the final judgment matters more than the tokens spent getting
 there; the point of splitting this into two passes below is to spend tokens
 only on the judgment call itself, not on mechanical bookkeeping (re-deriving
 a ranking, hand-formatting JSONL edits) that Python can do for free.
 
-### 5.1 — Compute cheap prescreen signals (zero tokens)
+### 7.1 — Compute cheap prescreen signals (zero tokens)
 
 ```bash
 python tool/score_papers.py --question "..." --slug "..."
@@ -425,14 +588,16 @@ table:
 Neither signal reads the actual argument of the paper. Use them to decide
 review order, not inclusion/exclusion.
 
-### 5.2 — Rubric-based relevance pass (your judgment)
+### 7.2 — Rubric-based relevance pass (your judgment)
 
-Read the abstracts — starting from `score_papers.py`'s ranked output, but
-don't stop at an arbitrary cutoff; a paper with a low heuristic/similarity
-score can still be highly relevant (e.g. an under-cited paper using
-different terminology), so skim past the top of the ranking rather than
-truncating it. Batch this (e.g. 15–25 abstracts read together, from
-`brainstorm/<slug>/papers.md`) rather than one API round-trip per paper.
+Read each paper's **summary** (`summary_path`, from Step 6) if it has one —
+it already distills the full text, so re-reading the PDF here is redundant.
+Only fall back to the raw abstract for a paper Step 6 didn't reach yet. Start
+from `score_papers.py`'s ranked output, but don't stop at an arbitrary
+cutoff — a paper with a low heuristic/similarity score can still be highly
+relevant, so skim past the top of the ranking rather than truncating it.
+Batch this (e.g. 15–25 summaries read together) rather than one round-trip
+per paper.
 
 For each paper, assign:
 - `relevance_score` — your judgment of how important this paper is for
@@ -440,7 +605,7 @@ For each paper, assign:
   for something else (0 = off-topic despite matching the query; 5 = directly,
   substantially relevant).
 - `relevance_rationale` — one sentence on *why* (not a summary of the
-  abstract — the reason for the score).
+  abstract/summary — the reason for the score).
 
 Write these into a JSON file (paper id → `{relevance_score, relevance_rationale}`;
 ids are the `id` field already on each store record, e.g. `"doi:10.1234/..."`)
@@ -455,57 +620,144 @@ This overwrites `relevance_score`/`relevance_rationale` on the named records
 an explicit correction) and refreshes `papers.md`, now sorted with
 `relevance_score` taking priority over the cheap prescreen signals.
 
-### 5.3 — Report back
+### 7.3 — Report back
 
 Report: how many papers were scored, the relevance-score distribution (e.g.
-"12 at 5, 30 at 3–4, ~150 at 0–2"), and anything the heuristic/similarity
-signals got notably wrong (informs whether to trust them more or less next
-round).
+"12 at 5, 30 at 3–4, ~150 at 0–2"), how many were scored from a full summary
+vs. abstract-only fallback, and anything the heuristic/similarity signals got
+notably wrong (informs whether to trust them more or less next round).
 
 ---
 
-## Step 6 — Fetch PDFs
+## Checkpoint After Step 7
 
-**Goal:** Get full-text PDFs onto disk for papers worth reading in full,
-so later extraction doesn't depend on re-fetching from the network per field.
+At the end of Step 7, in addition to the Step 4 checkpoint outputs above:
+
+| Output | Format | Contents |
+|---|---|---|
+| `brainstorm/<slug>/papers.md` | Markdown | Sorted by `relevance_score` (or the cheap signals if unscored), with score/rationale/pdf-status/summary-link shown per paper |
+| `brainstorm/<slug>/pdfs/*.pdf` | PDF | Downloaded full texts, filenamed by paper id |
+| `brainstorm/<slug>/pdfs/_manual_download_needed.md` | Markdown | Papers that need manual PDF retrieval (only present if non-empty) |
+| `brainstorm/<slug>/summaries/*.md` | Markdown | One structured summary per paper, filenamed by paper id |
+| `brainstorm/data/papers.jsonl` | JSONL | Now also carries `pdf_path`, `pdf_status`, `summary_path`, `summary_status`, `heuristic_score`, `similarity_score`, `relevance_score`, `relevance_rationale` |
+
+Report the `relevance_score` distribution (as in 7.3).
+
+**Do not start the refinement loop (Step 8 onward) without the user's approval.**
+
+---
+
+## Step 8 — Triage
+
+**Goal:** Turn `relevance_score` into an actionable bucket per paper, so
+citation expansion (Step 9) knows which papers to expand from, and so the
+corpus stays navigable as rounds accumulate. Nothing is deleted here —
+`excluded` papers keep full provenance in the store.
 
 ```bash
-python tool/fetch_pdfs.py --question "..." --slug "..." [--limit N]
+python tool/triage_papers.py --question "..." --slug "..." [--core-min 4] [--exclude-max 1]
 ```
 
-Per paper, this tries (in order): the `pdf_url` already on the record (open
-access found during retrieval) → an Unpaywall lookup by DOI (aggregates
-open-access copies beyond what OpenAlex/Europe PMC surfaced) → the DOI's
-publisher landing page's `citation_pdf_url` meta tag (works for subscribed
-content only if the current network is recognized by the publisher as a
-subscriber — e.g. an institute connection; otherwise this step just fails
-closed, it never attempts to defeat a paywall). Every download is verified
-to actually be a PDF (`%PDF` magic bytes / `Content-Type`) before being kept,
-so a login or error page is never saved as a false success.
+Writes `status` (`core` / `borderline` / `excluded` / `unscored`) onto every
+scored record and writes `brainstorm/<slug>/core_papers.md` — the working
+set for everything downstream (citation expansion now, extraction later).
+The default thresholds (core ≥ 4, excluded ≤ 1 on the 0–5 scale from 7.2)
+are a reasonable starting point; tighten `--core-min` if the core tier comes
+back too large to expand citations from usefully.
 
-Writes `pdf_path`/`pdf_status` onto each record; papers that end up
-`unavailable` are listed in `brainstorm/<slug>/pdfs/_manual_download_needed.md`
-for manual retrieval. Run with `--limit N` first on a large store to sanity
-check before fetching everything (it makes one or more outbound requests per
-paper, with a politeness delay between them, so it's slow for large stores).
+Report back: the core/borderline/excluded/unscored counts.
 
-Report back: counts by `pdf_status`, and the path to
-`_manual_download_needed.md` if non-empty.
+---
+
+## Step 9 — Expand Citations
+
+**Goal:** Follow the citation graph outward from papers already confirmed
+relevant (`status: core`) to find papers that keyword search structurally
+can't — different terminology, older papers indexed differently, work in an
+adjacent subfield. This is usually the single highest-yield step in the
+whole loop (`process.md` Step 8).
+
+```bash
+python tool/expand_citations.py --question "..." --slug "..." --round <N> [--max-per-paper 25]
+```
+
+`<N>` should be the next unused round number (e.g. `2` after Step 3's round
+1). For each core-tier paper, this pulls up to `--max-per-paper` backward
+references (what it cites) and forward citations (what cites it) via
+OpenAlex, backfilling citation-graph fields via a DOI lookup first for core
+papers that didn't originally come from OpenAlex. New candidates are added
+to the store tagged `query_tag = "citation:backward"` or `"citation:forward"`,
+deduplicated the same way a normal search round is.
+
+**These new papers still need Steps 5–8 run on them** (PDF fetch, summarize,
+score, triage) before they can seed a further round of expansion or inform
+Step 10 — they enter the loop at the same point round 1's papers did, they
+just came from citations instead of a taxonomy query.
+
+Report back: backward/forward counts fetched, count after dedup, and how
+many were genuinely new to the store.
+
+---
+
+## Step 10 — Refresh the Taxonomy and Loop Back
+
+**Goal:** Use what this round surfaced to write a better taxonomy for the
+next round, instead of re-running the same queries (`process.md` Steps 9–10).
+
+Two inputs, both already on disk:
+- **Unproductive taxonomy cells** —
+  ```bash
+  python tool/round_report.py --question "..." --slug "..." --by-tag
+  ```
+  shows total/core counts per `query_tag`. A cell with a lot of hits and no
+  core papers is too broad or off-target; narrow it or drop it. A cell with
+  very few hits may need a broader OR-term.
+- **Gaps / Open Questions** — read this section across the core papers'
+  summaries (Step 6). Recurring terminology or subtopics mentioned there but
+  absent from the current taxonomy's `or_terms` are exactly what a new
+  taxonomy row/column should cover.
+
+Write the refined taxonomy to `brainstorm/<slug>/taxonomy/round_NN.py` (next
+round number) following Step 2's rules, then go back to **Step 2** with it —
+Steps 2–4 produce this round's new search-based candidates the same way
+round 1 did, in parallel with (or after) Step 9's citation-expansion
+candidates for the same round number.
+
+---
+
+## Step 11 — Check Saturation
+
+**Goal:** Decide whether another round is worth running, instead of looping
+indefinitely (`process.md` Step 11).
+
+```bash
+python tool/round_report.py --question "..." --slug "..."
+```
+
+Reports new-papers and new-core-papers per round and a verdict: `SATURATED`
+once the last couple of rounds each contributed fewer than a few new core
+papers (tune with `--saturation-rounds`/`--saturation-threshold`).
+
+Report the verdict to the user along with the current `core_papers.md`
+count. **Do not start another loop iteration (Step 9/10) without the user's
+approval** — whether or not the tool says saturated, stopping or continuing
+is the user's call, not something to decide unilaterally.
 
 ---
 
 ## Output Contract
 
-At the end of Step 6, in addition to the Step 4 checkpoint outputs above:
+At the end of a loop iteration, in addition to the Step 7 checkpoint outputs above:
 
 | Output | Format | Contents |
 |---|---|---|
-| `brainstorm/<slug>/papers.md` | Markdown | Now sorted by `relevance_score` (or the cheap signals if unscored), with score/rationale/pdf-status shown per paper |
-| `brainstorm/<slug>/pdfs/*.pdf` | PDF | Downloaded full texts, filenamed by paper id |
-| `brainstorm/<slug>/pdfs/_manual_download_needed.md` | Markdown | Papers that need manual PDF retrieval (only written if non-empty) |
-| `brainstorm/data/papers.jsonl` | JSONL | Now also carries `heuristic_score`, `similarity_score`, `relevance_score`, `relevance_rationale`, `pdf_path`, `pdf_status` |
+| `brainstorm/<slug>/core_papers.md` | Markdown | Just the `status: core` tier — the working set for extraction |
+| `brainstorm/<slug>/taxonomy/round_NN.py` | Python | Each round's taxonomy spec, refined from the previous round's yield |
+| `brainstorm/data/papers.jsonl` | JSONL | Now also carries `status`, `referenced_works`, `cited_by_api_url` |
 
-**Do not proceed to full-text extraction (`process.md` Step 7) without the user's approval.**
+**Do not proceed to structured field extraction (`process.md` Step 7 — full
+field extraction from `core_papers.md`, a separate step from this document's
+own Step 7, which is scoring) without the user's approval.**
 
 ---
 
@@ -521,3 +773,9 @@ At the end of Step 6, in addition to the Step 4 checkpoint outputs above:
 | A query returns 0 hits | Query too narrow, MeSH term not indexed | Try the free-text version; check for typos |
 | `similarity_score` is low on a clearly relevant paper | TF-IDF is lexical, not semantic — the paper uses different terminology than the question | Don't exclude on this signal alone; trust the rubric read (5.2) over it |
 | `fetch_pdfs.py` reports mostly `unavailable` | Papers are paywalled and the current network isn't recognized as a subscriber (no institute VPN/IP) | Expected outside the institute network; use `_manual_download_needed.md` for manual retrieval |
+| A manually-placed PDF isn't picked up on re-run | Filename doesn't exactly match `_manual_download_needed.md`'s "Save as" value | Rename it to match exactly (`paper_store.safe_filename` is the source of truth) |
+| PDF text looks garbled or empty when read | Scanned image PDF with no text layer (common for old papers), or a corrupted download | Fall back to summarizing from the abstract, note it in **Source**, and consider deleting/re-fetching the file |
+| `link_summaries.py` still shows a paper "missing" after you wrote its file | Filename doesn't match `safe_filename(paper_id, ".md")` for that record's `id` | Check the id in `papers.jsonl`/`papers.md` and rename the summary file to match exactly |
+| `expand_citations.py` errors "no seed papers to expand from" | `triage_papers.py` hasn't been run yet, or no paper scored `core` | Run Step 8 first, or lower `--core-min`, or pass `--min-relevance` to bypass triage |
+| `expand_citations.py` finds few/no backward references for a paper | The seed paper isn't in OpenAlex and has no DOI to backfill from (e.g. an old paper only indexed in PubMed) | Expected for some papers; forward citations may still work if it has a DOI |
+| `round_report.py` never reports `SATURATED` | Citation expansion keeps surfacing new core papers each round | That's the loop working as intended — keep going while it's productive, or stop earlier by user judgment regardless of the verdict |

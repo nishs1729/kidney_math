@@ -1,6 +1,6 @@
 # Literature Search Tools
 
-Zero-dependency Python tools implementing Steps 1–6 of the search loop
+Zero-dependency Python tools implementing Steps 1–11 of the search loop
 (`process.md`, `instructions.md`): querying **PubMed**, **OpenAlex**, and
 **bioRxiv/medRxiv** preprints, deduplicating, scoring, and fetching PDFs into
 a durable paper store per question. Designed for AI agents conducting
@@ -17,10 +17,14 @@ whoever is reading the abstracts.
 | `paper_store.py` | Durable JSONL paper store, keyed by question, with Markdown export |
 | `run_loop.py` | CLI runner — Steps 1–4 end-to-end, writes into the paper store |
 | `enrich_abstracts.py` | Follow-up pass: fetches abstracts for store records that don't have one |
+| `fetch_pdfs.py` | CLI: downloads PDFs into `brainstorm/<slug>/pdfs/` — open access first, then an institute-network fallback, then a manual-placement check |
+| `link_summaries.py` | CLI: scans `brainstorm/<slug>/summaries/` and registers written summary files back into the store |
 | `scoring.py` | Zero-token relevance signals: `heuristic_score` (metadata) + `similarity_scores` (TF-IDF vs. the question) |
 | `score_papers.py` | CLI: computes/stores the above for a question, prints a ranked table |
-| `apply_scores.py` | CLI: persists rubric-based `relevance_score`/`relevance_rationale` (from actually reading abstracts) into the store |
-| `fetch_pdfs.py` | CLI: downloads PDFs into `brainstorm/<slug>/pdfs/` — open access first, then an institute-network fallback |
+| `apply_scores.py` | CLI: persists rubric-based `relevance_score`/`relevance_rationale` (from reading each paper's summary) into the store |
+| `triage_papers.py` | CLI: buckets papers into `status` core/borderline/excluded from `relevance_score`, writes `core_papers.md` |
+| `expand_citations.py` | CLI: pulls backward references + forward citations for core-tier papers via OpenAlex |
+| `round_report.py` | CLI: per-round and per-tag yield report, plus a saturation verdict |
 
 ## Output layout
 
@@ -34,8 +38,12 @@ brainstorm/
 │   ├── pdfs/
 │   │   ├── *.pdf                        <- downloaded full texts
 │   │   └── _manual_download_needed.md   <- papers that need manual retrieval
+│   ├── summaries/
+│   │   └── *.md                         <- one structured summary per paper
+│   ├── core_papers.md    <- just the status:core tier (from triage_papers.py)
 │   └── taxonomy/
-│       └── round_01.py   <- Step-2 query spec, saved for provenance
+│       ├── round_01.py   <- Step-2 query spec, saved for provenance
+│       └── round_02.py   <- refined each loop iteration (Step 10)
 └── data/
     └── papers.jsonl      <- the shared store (all questions)
 ```
@@ -92,7 +100,38 @@ python tool/enrich_abstracts.py
 Batches PubMed lookups by PMID and looks up bioRxiv/medRxiv abstracts by DOI
 via Europe PMC, then refreshes every affected question's `papers.md`.
 
-### 4. Score for relevance
+### 4. Fetch PDFs
+
+```bash
+python tool/fetch_pdfs.py --question "..." --slug "..." [--limit N]
+```
+
+Tries a file already at the expected path (see below), then an open-access
+`pdf_url`/Unpaywall lookup, then a `citation_pdf_url` meta-tag fetch off the
+DOI's landing page (works for subscribed content only if the current network
+is recognized by the publisher, e.g. an institute connection — never
+attempts to defeat a paywall). Every download is verified to actually be a
+PDF before being kept. Failures land in
+`brainstorm/<slug>/pdfs/_manual_download_needed.md`, each with the exact
+filename to save a manually-obtained copy as; save it there and re-run the
+same command (without `--force`) to have it picked up automatically as
+`pdf_status: downloaded:manual`.
+
+### 5. Summarize papers
+
+For each paper (full-text PDF if available, abstract otherwise), write a
+structured Markdown summary to `brainstorm/<slug>/summaries/<file>.md` (see
+`instructions.md` Step 6 for the template and filename convention), then
+register the batch:
+
+```bash
+python tool/link_summaries.py --question "..." --slug "..."
+```
+
+Sets `summary_path`/`summary_status` on matching records, refreshes
+`papers.md`, and reports how many summaries are written vs. still missing.
+
+### 6. Score for relevance
 
 ```bash
 python tool/score_papers.py --question "..." --slug "..."
@@ -102,9 +141,10 @@ Writes `heuristic_score` (0–100: citation velocity, taxonomy tag coverage,
 review boost) and `similarity_score` (0–1: TF-IDF cosine similarity to the
 question — lexical, not semantic) onto every paper, and prints a ranked
 table. Neither reads the argument of the paper — they're for prioritizing
-which abstracts to read first, not a verdict.
+review order, not a verdict.
 
-After reading abstracts and forming a rubric-based judgment, persist it:
+After reading each paper's summary (from step 5) and forming a rubric-based
+judgment, persist it:
 
 ```bash
 python tool/apply_scores.py scores.json --question "..." --slug "..."
@@ -113,18 +153,24 @@ python tool/apply_scores.py scores.json --question "..." --slug "..."
 where `scores.json` is `{paper_id: {"relevance_score": 0-5, "relevance_rationale": "..."}}`.
 This is the score that then drives `papers.md`'s sort order.
 
-### 5. Fetch PDFs
+### 7. Triage, expand citations, refresh, repeat
 
 ```bash
-python tool/fetch_pdfs.py --question "..." --slug "..." [--limit N]
+python tool/triage_papers.py --question "..." --slug "..."       # status: core/borderline/excluded
+python tool/expand_citations.py --question "..." --slug "..." --round 2   # citation graph off the core tier
+python tool/round_report.py --question "..." --slug "..." --by-tag        # which taxonomy cells/rounds paid off
 ```
 
-Tries an open-access `pdf_url`/Unpaywall lookup first, then a
-`citation_pdf_url` meta-tag fetch off the DOI's landing page (works for
-subscribed content only if the current network is recognized by the
-publisher, e.g. an institute connection — never attempts to defeat a
-paywall). Every download is verified to actually be a PDF before being kept.
-Failures land in `brainstorm/<slug>/pdfs/_manual_download_needed.md`.
+`expand_citations.py` pulls backward references and forward citations (via
+OpenAlex) for every `status: core` paper and adds new candidates at the
+given round — the highest-yield way to find relevant work that keyword
+search structurally can't. Its new papers loop back through steps 3–6
+(PDF/summarize/score) before another round can triage/expand from them.
+`round_report.py`'s `--by-tag` table plus the *Gaps* sections in Step 5's
+summaries are the inputs for writing the next round's taxonomy (back to
+step 1); its plain (no `--by-tag`) form reports a `SATURATED` verdict once
+new rounds stop contributing core papers. See `instructions.md` Steps 8–11
+for the full loop.
 
 ---
 
@@ -167,6 +213,8 @@ keywords        list[str]   MeSH terms or OpenAlex concepts
 pub_types       list[str]   publication types (PubMed/Europe PMC only)
 is_review       bool        derived from pub_types (PubMed/Europe PMC only)
 is_preprint     bool
+referenced_works    list[str]   OpenAlex short IDs this paper cites (OpenAlex only)
+cited_by_api_url    str         ready-made OpenAlex URL for this paper's citing works (OpenAlex only)
 ```
 
 ---

@@ -3,6 +3,9 @@
 fetch_pdfs.py — Download PDFs for papers in the store into brainstorm/<slug>/pdfs/.
 
 Tries, per paper, in order:
+  0. A file already sitting at the expected destination path — trusted as-is
+     (after verifying it's really a PDF) with no network call. This is what
+     makes the manual-download workflow below "just re-run the script."
   1. `pdf_url` already on the record (open-access location found by OpenAlex
      or Europe PMC during retrieval).
   2. Unpaywall (api.unpaywall.org) lookup by DOI — aggregates open-access
@@ -22,11 +25,13 @@ login page or error page never gets saved as a fake "success".
 Writes back onto each record:
     pdf_path    path to the saved file, relative to the repo root
     pdf_status  "downloaded:open_access" | "downloaded:institute" |
-                "unavailable" | "error:<message>"
+                "downloaded:manual" | "unavailable" | "error:<message>"
 
 Papers that end up "unavailable" are also listed in
-brainstorm/<slug>/pdfs/_manual_download_needed.md (title, DOI, URL) so they
-can be fetched by hand.
+brainstorm/<slug>/pdfs/_manual_download_needed.md (title, DOI, URL, and the
+exact filename to save as) so they can be fetched by hand — save the file
+under that name in the same pdfs/ directory, then re-run this script (no
+flags needed) to have it picked up and marked "downloaded:manual".
 
 Usage:
     python tool/fetch_pdfs.py --question "..." [--slug ...] [--limit N] [--force]
@@ -46,7 +51,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tool.paper_store import DEFAULT_STORE_PATH, BRAINSTORM_ROOT, load, save, question_dir
+from tool.paper_store import DEFAULT_STORE_PATH, BRAINSTORM_ROOT, load, save, question_dir, safe_filename
 
 _USER_AGENT = "LiteratureSurveyTool/1.0 (agent-literature-survey)"
 _UNPAYWALL_BASE = "https://api.unpaywall.org/v2"
@@ -124,15 +129,20 @@ def _citation_pdf_url_from_landing_page(doi: str) -> Optional[str]:
     return None
 
 
-def _safe_filename(paper_id: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]", "_", paper_id) + ".pdf"
-
-
 def fetch_one(record: Dict[str, Any], out_dir: Path) -> Tuple[str, Optional[str]]:
     """Returns (pdf_status, pdf_path or None)."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    dest = out_dir / _safe_filename(record["id"])
+    dest = out_dir / safe_filename(record["id"], ".pdf")
     doi = (record.get("doi") or "").strip()
+
+    # A file may already sit here because it was placed manually (see Step 5's
+    # manual-download checkpoint in instructions.md) — trust it without a
+    # network call if it's a real PDF, so a plain re-run after manual
+    # downloads picks it up automatically.
+    if dest.exists() and dest.stat().st_size > 0:
+        with dest.open("rb") as fh:
+            if fh.read(5) == b"%PDF-":
+                return "downloaded:manual", str(dest.relative_to(_REPO_ROOT))
 
     if record.get("pdf_url"):
         body = _try_download(record["pdf_url"])
@@ -171,7 +181,10 @@ def main() -> None:
     ap.add_argument("--slug", default=None)
     ap.add_argument("--store-path", default=str(DEFAULT_STORE_PATH))
     ap.add_argument("--limit", type=int, default=None, help="Only attempt the first N missing papers (for testing)")
-    ap.add_argument("--force", action="store_true", help="Re-attempt papers that already have a pdf_path/pdf_status")
+    ap.add_argument("--force", action="store_true",
+                     help="Re-attempt every paper, including ones already downloaded. Without this flag, a "
+                          "plain re-run only retries papers that are missing or came back 'unavailable'/'error:*' "
+                          "last time — which is exactly what you want after placing PDFs manually.")
     args = ap.parse_args()
 
     store_path = Path(args.store_path)
@@ -182,14 +195,19 @@ def main() -> None:
         sys.exit(1)
 
     if not args.force:
-        records = [r for r in records if not r.get("pdf_status")]
+        records = [
+            r for r in records
+            if not r.get("pdf_status")
+            or r["pdf_status"] == "unavailable"
+            or r["pdf_status"].startswith("error:")
+        ]
     if args.limit:
         records = records[: args.limit]
 
     qdir = question_dir(args.question, args.slug, BRAINSTORM_ROOT)
     out_dir = qdir / "pdfs"
 
-    counts = {"downloaded:open_access": 0, "downloaded:institute": 0, "unavailable": 0}
+    counts = {"downloaded:open_access": 0, "downloaded:institute": 0, "downloaded:manual": 0, "unavailable": 0}
     manual_needed = []
 
     for i, r in enumerate(records, 1):
@@ -209,10 +227,15 @@ def main() -> None:
     save(store, store_path)
 
     if manual_needed:
-        lines = [f"# Papers needing manual PDF download ({len(manual_needed)})\n"]
+        lines = [
+            f"# Papers needing manual PDF download ({len(manual_needed)})\n",
+            "To have these picked up automatically, save the PDF under the exact filename "
+            "given below (in this same directory), then re-run `fetch_pdfs.py` without `--force`.\n",
+        ]
         for r in manual_needed:
             lines.append(f"- **{r.get('title', '(no title)')}**")
             lines.append(f"  DOI: {r.get('doi') or 'n/a'} | URL: {r.get('url') or 'n/a'}")
+            lines.append(f"  Save as: `{safe_filename(r['id'], '.pdf')}`")
         (out_dir / "_manual_download_needed.md").write_text("\n".join(lines), encoding="utf-8")
 
     print(f"Attempted {len(records)} papers.")

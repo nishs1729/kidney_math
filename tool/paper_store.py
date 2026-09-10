@@ -35,7 +35,15 @@ Optionally, once scoring has been run (see `score_papers.py` / `apply_scores.py`
 
 And once PDFs have been fetched (see `fetch_pdfs.py`):
   pdf_path            str   path to the downloaded PDF, relative to the repo root
-  pdf_status          str   "downloaded:open_access" | "downloaded:institute" | "unavailable" | "error:<msg>"
+  pdf_status          str   "downloaded:open_access" | "downloaded:institute" |
+                             "downloaded:manual" | "unavailable" | "error:<msg>"
+
+And once summaries have been written (see `link_summaries.py`):
+  summary_path        str   path to the paper's summary .md, relative to the repo root
+  summary_status      str   "written" | "missing"
+
+And once triaged (see `triage_papers.py`):
+  status               str   "core" | "borderline" | "excluded" | "unscored"
 
 Usage:
     from tool.paper_store import load, upsert, export_question
@@ -228,6 +236,8 @@ def export_markdown(
             f"tags: `{', '.join(r.get('query_tags', []))}`"
         )
         score_bits = []
+        if r.get("status"):
+            score_bits.append(f"status: {r['status']}")
         if r.get("relevance_score") is not None:
             score_bits.append(f"relevance: {r['relevance_score']}")
         if r.get("heuristic_score") is not None:
@@ -236,6 +246,8 @@ def export_markdown(
             score_bits.append(f"similarity: {r['similarity_score']}")
         if r.get("pdf_status"):
             score_bits.append(f"pdf: {r['pdf_status']}")
+        if r.get("summary_path"):
+            score_bits.append(f"[summary]({r['summary_path']})")
         if score_bits:
             lines.append(" | ".join(score_bits))
         if r.get("relevance_rationale"):
